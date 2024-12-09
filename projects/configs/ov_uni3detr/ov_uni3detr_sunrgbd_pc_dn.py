@@ -142,7 +142,7 @@ model = dict(
 
 
 dataset_type = 'SUNRGBDDataset_OV'
-data_root = 'data/sunrgbd_coda/'
+data_root = 'data/sunrgbd/'
 class_names = ('chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'box', 
               'lamp', 'garbage_bin', 'cabinet', 'shelf', 'drawer', 'sink', 'night_stand', 'kitchen_counter', 
               'paper', 'end_table', 'kitchen_cabinet', 'picture', 'book', 'stool', 'coffee_table', 'bookshelf', 
@@ -204,8 +204,8 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=8,
-    workers_per_gpu=0,
+    samples_per_gpu=2,
+    workers_per_gpu=4,
     train=dict(
         type='RepeatDataset',
         times=2,  #######5
@@ -223,7 +223,7 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         #  ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
-        ann_file=data_root + 'sunrgbd_infos_val_withimg.pkl',
+        ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,
@@ -234,7 +234,7 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         #  ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
-        ann_file=data_root + 'sunrgbd_infos_val_withimg.pkl',
+        ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,

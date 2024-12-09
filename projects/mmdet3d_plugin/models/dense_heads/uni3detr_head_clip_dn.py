@@ -569,12 +569,16 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             bs = fpsbpts.shape[0]
 
             if pts_feats.requires_grad:
-                tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:]])
-                #  query_embeds = torch.cat([tgt_embed.unsqueeze(0).expand(bs, -1, -1), torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)], -1)
                 reference_points = torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)
+                ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas)
+                num_dn_q = ref_points.shape[1] - reference_points.shape[1]
+
+                tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:],
+                                       tgt_embed[self.num_query:self.num_query+num_dn_q]])
+                breakpoint()
 
                 # for gt dn
-                ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas)
+                query_embeds = torch.cat([tgt_embed.unsqueeze(0).expand(bs, -1, -1), ref_points], -1)
             else:
                 random_point = torch.rand(fpsbpts.shape, device=fpsbpts.device)[:, :self.num_query, :]
                 tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:], tgt_embed[self.num_query:]])

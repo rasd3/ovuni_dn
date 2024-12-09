@@ -74,20 +74,20 @@ class SUNRGBDData(object):
         self.split = split
         self.split_dir = osp.join(root_path, 'sunrgbd_trainval')
         self.num_points = num_points
-        self.classes = [
-            'chair', 'table', 'desk', 'pillow', 'lamp',
-            'box', 'sofa', 'cabinet', 'garbage_bin', 'bed'
-        ]
+        #  self.classes = [
+            #  'chair', 'table', 'desk', 'pillow', 'lamp',
+            #  'box', 'sofa', 'cabinet', 'garbage_bin', 'bed'
+        #  ]
         #  self.classes = [
             #  'chair', 'table', 'pillow', 'desk', 'bed', 'sofa', 'lamp', 'garbage_bin',
             #  'cabinet', 'sink', 'night_stand', 'stool', 'bookshelf', 'dresser', 'toilet',
             #  'fridge', 'microwave', 'counter', 'bathtub', 'scanner']
-        #  self.classes = ['chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'box',
-              #  'lamp', 'garbage_bin', 'cabinet', 'shelf', 'drawer', 'sink', 'night_stand', 'kitchen_counter',
-              #  'paper', 'end_table', 'kitchen_cabinet', 'picture', 'book', 'stool', 'coffee_table', 'bookshelf',
-              #  'painting', 'key_board', 'dresser', 'tv', 'whiteboard', 'cpu', 'toilet', 'file_cabinet', 'bench',
-              #  'ottoman', 'plant', 'monitor', 'printer', 'recycle_bin', 'door', 'fridge', 'towel', 'cup', 'mirror',
-              #  'laptop', 'cloth']
+        self.classes = ['chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'box',
+              'lamp', 'garbage_bin', 'cabinet', 'shelf', 'drawer', 'sink', 'night_stand', 'kitchen_counter',
+              'paper', 'end_table', 'kitchen_cabinet', 'picture', 'book', 'stool', 'coffee_table', 'bookshelf',
+              'painting', 'key_board', 'dresser', 'tv', 'whiteboard', 'cpu', 'toilet', 'file_cabinet', 'bench',
+              'ottoman', 'plant', 'monitor', 'printer', 'recycle_bin', 'door', 'fridge', 'towel', 'cup', 'mirror',
+              'laptop', 'cloth']
         self.cat2label = {cat: self.classes.index(cat) for cat in self.classes}
         self.label2cat = {
             label: self.classes[label]

@@ -36,8 +36,8 @@ def create_indoor_info_file(data_path,
     # generate infos for both detection and segmentation task
     if pkl_prefix in ['sunrgbd', 'scannet']:
         train_filename = os.path.join(save_path,
-                                      f'{pkl_prefix}_infos_train_top10cls.pkl')
-        val_filename = os.path.join(save_path, f'{pkl_prefix}_infos_val_top10cls.pkl')
+                                      f'{pkl_prefix}_infos_train_46cls.pkl')
+        val_filename = os.path.join(save_path, f'{pkl_prefix}_infos_val_46cls.pkl')
         if pkl_prefix == 'sunrgbd':
             # SUN RGB-D has a train-val split
             num_points = kwargs.get('num_points', -1)
