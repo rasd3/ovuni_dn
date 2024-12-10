@@ -98,6 +98,7 @@ class Uni3DETRTransformer(BaseModule):
                 query_embed,
                 num_query,
                 reg_branches=None,
+                ng=None,
                 **kwargs):
         
         assert query_embed is not None
@@ -109,7 +110,8 @@ class Uni3DETRTransformer(BaseModule):
         query = query.permute(1, 0, 2)
         
         nq = num_query
-        ng = int(len(query) // nq)
+        if ng is None:
+            ng = int(len(query) // nq)
         inter_states = []
         inter_references = []
         for g in range(ng):

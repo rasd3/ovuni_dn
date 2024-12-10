@@ -142,7 +142,7 @@ model = dict(
 
 
 dataset_type = 'SUNRGBDDataset_OV'
-data_root = 'data/sunrgbd_coda/'
+data_root = 'data/sunrgbd/'
 class_names = ('chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'box', 
               'lamp', 'garbage_bin', 'cabinet', 'shelf', 'drawer', 'sink', 'night_stand', 'kitchen_counter', 
               'paper', 'end_table', 'kitchen_cabinet', 'picture', 'book', 'stool', 'coffee_table', 'bookshelf', 

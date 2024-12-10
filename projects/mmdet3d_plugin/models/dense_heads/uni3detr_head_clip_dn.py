@@ -547,7 +547,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
 
 
     @auto_fp16(apply_to=("pts_feats",))
-    def forward(self, pts_feats, img_metas, fpsbpts, gt_bboxes_3d, gt_bboxes=None):
+    def forward(self, pts_feats, img_metas, fpsbpts, gt_bboxes_3d=None, gt_bboxes=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -571,11 +571,10 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             if pts_feats.requires_grad:
                 reference_points = torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)
                 ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas)
-                num_dn_q = ref_points.shape[1] - reference_points.shape[1]
+                num_dn_q = mask_dict['pad_size']
 
                 tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:],
                                        tgt_embed[self.num_query:self.num_query+num_dn_q]])
-                breakpoint()
 
                 # for gt dn
                 query_embeds = torch.cat([tgt_embed.unsqueeze(0).expand(bs, -1, -1), ref_points], -1)
@@ -600,6 +599,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             self.num_query,
             reg_branches=self.reg_branches if self.with_box_refine else None,
             img_metas=img_metas,
+            ng=4,
         )
 
         hs = hs.permute(0, 2, 1, 3)
@@ -653,6 +653,28 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             'all_iou_preds': outputs_ious,
             'all_uncertainty_preds': outputs_uncertainties,
         }
+
+        if self.training:
+            # separate query
+            dn_pad_size = mask_dict['pad_size']
+
+            outputs_classes = outputs_classes[:, :, :-dn_pad_size, :]
+            outputs_coords = outputs_coords[:, :, :-dn_pad_size, :]
+            outputs_ious = outputs_ious[:, :, :-dn_pad_size, :]
+            outputs_uncertainties = outputs_uncertainties[:, :, :-dn_pad_size, :]
+
+            dn_cls_scores = outputs_classes[:, :, -dn_pad_size:, :]
+            dn_bbox_preds = outputs_coords[:, :, -dn_pad_size:, :]
+            dn_iou_preds = outputs_ious[:, :, -dn_pad_size:, :]
+            dn_uncertainty_preds = outputs_uncertainties[:, :, -dn_pad_size:, :]
+
+            outs.update({
+                'dn_cls_scores': dn_cls_scores,
+                'dn_bbox_preds': dn_bbox_preds,
+                'dn_iou_preds': dn_iou_preds,
+                'dn_uncertainty_preds': dn_uncertainty_preds,
+                'dn_mask_dict': mask_dict
+            })
 
         return outs
 
@@ -861,6 +883,111 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         # loss_consistency = loss_consistency[torch.isfinite(loss_consistency)]
 
         return loss_cls, loss_bbox, loss_iou, loss_iou_pred, loss_consistency
+
+    def dn_loss_single(self,
+                       cls_scores,
+                       bbox_preds,
+                       iou_preds,
+                       uncertainty_preds,
+                       mask_dict):
+        """"Loss function for outputs from a single decoder layer of a single
+        feature level.
+        Args:
+            cls_scores (Tensor): Box score logits from a single decoder layer
+                for all images. Shape [bs, num_query, cls_out_channels].
+            bbox_preds (Tensor): Sigmoid outputs from a single decoder layer
+                for all images, with normalized coordinate (cx, cy, w, h) and
+                shape [bs, num_query, 4].
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components for outputs from
+                a single decoder layer.
+        """
+        num_imgs = cls_scores.size(0)
+        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
+        bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
+        uncertainty_preds_list = [uncertainty_preds[i] for i in range(num_imgs)]
+        uncertainty_preds = torch.cat(uncertainty_preds_list, 0)
+
+
+        known_labels, known_bboxs = mask_dict['known_lbs_bboxes']
+        map_known_indice = mask_dict['map_known_indice'].long()
+        known_indice = mask_dict['known_indice'].long()
+        batch_idx = mask_dict['batch_idx'].long()
+        bid = batch_idx[known_indice]
+        known_labels_raw = mask_dict['known_labels_raw']
+
+        cls_scores = cls_scores[(bid, map_known_indice)]
+        bbox_preds = bbox_preds[(bid, map_known_indice)]
+        iou_preds = iou_preds[(bid, map_known_indice)]
+        num_tgt = known_indice.numel()
+        num_total_pos = num_tgt
+
+        # filter task bbox
+        task_mask = known_labels_raw != cls_scores.shape[-1]
+        task_mask_sum = task_mask.sum()
+        
+        if task_mask_sum > 0:
+            # pred_logits = pred_logits[task_mask]
+            # known_labels = known_labels[task_mask]
+            bbox_preds = bbox_preds[task_mask]
+            known_bboxs = known_bboxs[task_mask]
+
+        bbox_targets = known_bboxs
+        labels = known_labels
+
+        uncertainty_preds = uncertainty_preds[list(range(labels.shape[0])), labels].clip(0.01)
+        uncertainty_exp = np.sqrt(2)*torch.exp(-uncertainty_preds[:,None])
+
+        # classification loss
+        label_weights = torch.ones_like(known_labels)
+        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
+        # construct weighted avg_factor to match with the official DETR repo
+        cls_avg_factor = num_tgt * 3.14159 / 6 * self.split * self.split  * self.split
+        cls_avg_factor = max(cls_avg_factor, 1)
+        #loss_cls = self.loss_cls(cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+
+        bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
+        normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
+        bboxes3d = denormalize_bbox(bbox_preds, self.pc_range) 
+
+        iou3d = bbox_overlaps_nearest_3d(bboxes3d, bbox_targets, is_aligned=True, coordinate='depth')
+        # iou3d = box_iou_rotated(DepthInstance3DBoxes(bbox_targets).bev, DepthInstance3DBoxes(bboxes3d).bev, aligned=True)
+        z1, z2, z3, z4 = self._bbox_to_loss(bboxes3d)[:, 2], self._bbox_to_loss(bboxes3d)[:, 5], self._bbox_to_loss(bbox_targets)[:, 2], self._bbox_to_loss(bbox_targets)[:, 5]
+        iou_z = torch.max(torch.min(z2, z4) - torch.max(z1, z3), z1.new_zeros(z1.shape)) / (torch.max(z2, z4) - torch.min(z1, z3) )
+        iou3d_dec = (iou3d + iou_z)/2
+
+        loss_cls = self.loss_cls(cls_scores, [labels, iou3d_dec], label_weights, avg_factor=cls_avg_factor)
+
+        # Compute the average number of gt boxes accross all gpus, for
+        # normalization purposes
+        num_total_pos = loss_cls.new_tensor([num_total_pos])
+        num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
+
+        # regression L1 loss
+        bbox_weights = torch.ones_like(bbox_preds)
+        isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
+        bbox_weights = bbox_weights * self.code_weights
+        
+        # loss_bbox = self.loss_bbox(bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
+        loss_bbox = self.loss_bbox(bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10] * uncertainty_exp, avg_factor=num_total_pos)
+
+        loss_iou_z = 1 - iou_z[isnotnan]
+        loss_iou = self.loss_iou(bboxes3d[isnotnan, :10], bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
+        loss_iou += torch.sum(loss_iou_z * bbox_weights[isnotnan, 0]) / num_total_pos
+
+        iou_preds = iou_preds.reshape(-1)
+        iou3d_true = torch.diag(bbox_overlaps_3d(bboxes3d, bbox_targets, coordinate='lidar')).detach()
+        loss_iou_pred = torch.sum(F.binary_cross_entropy_with_logits(iou_preds, iou3d_true, reduction='none') * bbox_weights[isnotnan, 0] ) / num_total_pos * 1.2 
+
+        loss_consistency = uncertainty_preds.mean()
+
+        # loss_cls = loss_cls[torch.isfinite(loss_cls)]
+        # loss_bbox = loss_bbox[torch.isfinite(loss_bbox)]
+        # loss_iou = loss_iou[torch.isfinite(loss_iou)]
+        # loss_iou_pred = loss_iou_pred[torch.isfinite(loss_iou_pred)]
+        # loss_consistency = loss_consistency[torch.isfinite(loss_consistency)]
+
+        return loss_cls, loss_bbox, loss_iou, loss_iou_pred, loss_consistency
     
     @staticmethod
     def _bbox_to_loss(bbox):
@@ -957,6 +1084,36 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             loss_dict[f'd{num_dec_layer}.loss_consistency'] = loss_consistency_i
             num_dec_layer += 1
             
+        # for dn queries
+        dn_cls_scores = preds_dicts['dn_cls_scores']
+        dn_bbox_preds = preds_dicts['dn_bbox_preds']
+        dn_iou_preds = preds_dicts['dn_iou_preds']
+        dn_uncertainty_preds = preds_dicts['dn_uncertainty_preds']
+
+        num_dec_layers = len(dn_cls_scores)
+        device = gt_labels_list[0].device
+
+        dn_mask_dict = [preds_dicts['dn_mask_dict'] for _ in range(len(dn_iou_preds))]
+        # calculate class and box loss
+        dn_losses_cls, dn_losses_bbox, dn_losses_iou, dn_losses_iou_pred, dn_losses_consistency = multi_apply(
+            self.dn_loss_single, dn_cls_scores, dn_bbox_preds, dn_iou_preds, dn_uncertainty_preds, dn_mask_dict)
+
+        # loss from the last decoder layer
+        loss_dict['dn_loss_cls'] = dn_losses_cls[-1]
+        loss_dict['dn_loss_bbox'] = dn_losses_bbox[-1]
+        loss_dict['dn_loss_iou'] = dn_losses_iou[-1]
+        loss_dict['dn_loss_iou_pred'] = dn_losses_iou_pred[-1]
+        loss_dict['dn_loss_consistency'] = dn_losses_consistency[-1]
+
+        # loss from other decoder layers
+        num_dec_layer = 0
+        for loss_cls_i, loss_bbox_i, loss_iou_i, loss_iou_pred_i, loss_consistency_i in zip(dn_losses_cls[:-1], dn_losses_bbox[:-1], dn_losses_iou[:-1], dn_losses_iou_pred[:-1], dn_losses_consistency[:-1]):
+            loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i
+            loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
+            loss_dict[f'd{num_dec_layer}.dn_loss_iou'] = loss_iou_i
+            loss_dict[f'd{num_dec_layer}.dn_loss_iou_pred'] = loss_iou_pred_i
+            loss_dict[f'd{num_dec_layer}.dn_loss_consistency'] = loss_consistency_i
+            num_dec_layer += 1
 
         return loss_dict
     
