@@ -336,6 +336,8 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                  loss_iou=dict(type='RotatedIoU3DLoss', loss_weight=1.0),
                  post_processing=None,
                  gt_repeattimes=1,
+                 noise_type='jitter',
+                 dn_weight=0.5,
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -377,8 +379,8 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.bbox_noise_scale = 0.3
         self.bbox_noise_trans = 0.
         self.split = 0.75
-        self.noise_type = 'jitter'
-        self.dn_weight = 0.5
+        self.noise_type = noise_type
+        self.dn_weight = dn_weight
 
 
     def _init_layers(self):
@@ -499,7 +501,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             pad_size = int(single_pad * groups)
             padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
             padding_bbox_repeated = padding_bbox.unsqueeze(0).repeat(batch_size, 1, 1)
-            padded_reference_points = torch.cat([padding_bbox_repeated, reference_points], dim=1)
+            padded_reference_points = torch.cat([reference_points, padding_bbox_repeated], dim=1)
 
             if len(known_num):
                 map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]

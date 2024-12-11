@@ -460,9 +460,10 @@ class Uni3DETRHeadCLIP(DETRHead):
                 Shape [nb_dec, bs, num_query, 9].
         """
         tgt_embed = self.tgt_embed.weight           # nq, 256
-        refanchor = self.refpoint_embed.weight      # nq, 6
+        refanchor = self.refpoint_embed.weight      # nq, 3
         #query_embeds = torch.cat((tgt_embed, refanchor), dim=1)
 
+        breakpoint()
         if fpsbpts is not None:
             bs = fpsbpts.shape[0]
 
