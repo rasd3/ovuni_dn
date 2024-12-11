@@ -445,7 +445,7 @@ class Uni3DETRHeadCLIP(DETRHead):
                 nn.init.constant_(m[-1].bias, bias_init)
 
     @auto_fp16(apply_to=("pts_feats",))
-    def forward(self, pts_feats, img_metas, fpsbpts):
+    def forward(self, pts_feats, img_metas, fpsbpts, gt_bboxes_3d=None, gt_bboxes=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream

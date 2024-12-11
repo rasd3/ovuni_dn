@@ -374,10 +374,11 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.post_processing = post_processing
         self.gt_repeattimes = gt_repeattimes
 
-        self.bbox_noise_scale = 1.0
+        self.bbox_noise_scale = 0.3
         self.bbox_noise_trans = 0.
         self.split = 0.75
         self.noise_type = 'jitter'
+        self.dn_weight = 0.5
 
 
     def _init_layers(self):
@@ -449,25 +450,6 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             for m in self.cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
 
-    def prepare_for_dn(self, img_metas, _gt_bboxes_3d, gt_bboxes):
-        b_size = len(img_metas)
-
-        gt_bboxes_3d = [box.tensor for box in _gt_bboxes_3d]
-        known_num = [t.size(0) for t in gt_bboxes_3d]
-        groups = min(10, self.num_query // max(known_num))
-        for b in range(b_size):
-            # project point from depth to image
-            gt_bboxes_cen = gt_bboxes_3d[b][:, :3]
-            xyz_depth = apply_3d_transformation(
-                gt_bboxes_cen, 'DEPTH', img_metas[b], reverse=True)
-            depth2img = xyz_depth.new_tensor(img_metas[b]['depth2img'])
-            uvz_origin = points_cam2img(xyz_depth, depth2img, True)
-            z_cam = uvz_origin[..., 2]
-            uv_origin = (uvz_origin[..., :2] - 1).round()
-
-            uv_rescaled = coord_2d_transform(img_metas[b], uv_origin, True)
-
-            # make noise
 
     def prepare_for_dn_cmt(self, batch_size, reference_points, img_metas):
         if self.training:
@@ -658,21 +640,15 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             # separate query
             dn_pad_size = mask_dict['pad_size']
 
-            outputs_classes = outputs_classes[:, :, :-dn_pad_size, :]
-            outputs_coords = outputs_coords[:, :, :-dn_pad_size, :]
-            outputs_ious = outputs_ious[:, :, :-dn_pad_size, :]
-            outputs_uncertainties = outputs_uncertainties[:, :, :-dn_pad_size, :]
-
-            dn_cls_scores = outputs_classes[:, :, -dn_pad_size:, :]
-            dn_bbox_preds = outputs_coords[:, :, -dn_pad_size:, :]
-            dn_iou_preds = outputs_ious[:, :, -dn_pad_size:, :]
-            dn_uncertainty_preds = outputs_uncertainties[:, :, -dn_pad_size:, :]
-
             outs.update({
-                'dn_cls_scores': dn_cls_scores,
-                'dn_bbox_preds': dn_bbox_preds,
-                'dn_iou_preds': dn_iou_preds,
-                'dn_uncertainty_preds': dn_uncertainty_preds,
+                'all_cls_scores': outputs_classes[:, :, :-dn_pad_size, :],
+                'all_bbox_preds': outputs_coords[:, :, :-dn_pad_size, :],
+                'all_iou_preds': outputs_ious[:, :, :-dn_pad_size, :],
+                'all_uncertainty_preds': outputs_uncertainties[:, :, :-dn_pad_size, :],
+                'dn_cls_scores': outputs_classes[:, :, -dn_pad_size:, :],
+                'dn_bbox_preds': outputs_coords[:, :, -dn_pad_size:, :],
+                'dn_iou_preds': outputs_ious[:, :, -dn_pad_size:, :],
+                'dn_uncertainty_preds': outputs_uncertainties[:, :, -dn_pad_size:, :],
                 'dn_mask_dict': mask_dict
             })
 
@@ -987,7 +963,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         # loss_iou_pred = loss_iou_pred[torch.isfinite(loss_iou_pred)]
         # loss_consistency = loss_consistency[torch.isfinite(loss_consistency)]
 
-        return loss_cls, loss_bbox, loss_iou, loss_iou_pred, loss_consistency
+        return loss_cls*self.dn_weight, loss_bbox*self.dn_weight, loss_iou*self.dn_weight, loss_iou_pred*self.dn_weight, loss_consistency*self.dn_weight
     
     @staticmethod
     def _bbox_to_loss(bbox):
