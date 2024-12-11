@@ -336,7 +336,8 @@ class OV_Uni3DETR(MVXTwoStageDetector):
                           img_metas,
                           gt_bboxes_ignore=None, 
                           fpsbpts=None,
-                          gt_bboxes=None):
+                          gt_bboxes=None,
+                          points=None):
         """Forward function for point cloud branch.
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -350,7 +351,7 @@ class OV_Uni3DETR(MVXTwoStageDetector):
             dict: Losses of each branch.
         """
         outs = self.pts_bbox_head(pts_feats, img_metas, fpsbpts, gt_bboxes_3d, 
-                                  gt_bboxes=gt_bboxes)
+                                  gt_bboxes=gt_bboxes, points=points)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
         losses = self.pts_bbox_head.loss(*loss_inputs)
         return losses
@@ -388,7 +389,7 @@ class OV_Uni3DETR(MVXTwoStageDetector):
         losses = dict()
         losses_pts = self.forward_pts_train(pts_feat, gt_bboxes_3d, gt_labels_3d, 
                                             img_metas, gt_bboxes_ignore, fpsbpts,
-                                            gt_bboxes=gt_bboxes)
+                                            gt_bboxes=gt_bboxes, points=points)
         losses.update(losses_pts)
 
         return losses

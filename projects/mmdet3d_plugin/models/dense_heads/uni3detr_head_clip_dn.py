@@ -453,7 +453,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                 nn.init.constant_(m[-1].bias, bias_init)
 
 
-    def prepare_for_dn_cmt(self, batch_size, reference_points, img_metas):
+    def prepare_for_dn_cmt(self, batch_size, reference_points, img_metas, points=None):
         if self.training:
             targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
             labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ]
@@ -484,11 +484,9 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                     known_bbox_center += torch.mul(rand_prob,
                                                 diff) * self.bbox_noise_scale
                 elif self.noise_type == 'ray':
-                    ray_direction = known_bbox_center / torch.norm(known_bbox_center, dim=-1, keepdim=True)
-    
-                    noise_magnitude = torch.rand_like(known_bbox_center[..., :1]) * 2 - 1.0 
-                    noise_magnitude *= diff * self.bbox_noise_scale
-                    known_bbox_center += ray_direction * noise_magnitude
+                    box_centers = boxes[:, :3]
+                    ray_scales = torch.linspace(0.7, 1.3, groups).view(groups, 1, 1)
+                    known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
 
                 known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
                 known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
@@ -531,7 +529,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
 
 
     @auto_fp16(apply_to=("pts_feats",))
-    def forward(self, pts_feats, img_metas, fpsbpts, gt_bboxes_3d=None, gt_bboxes=None):
+    def forward(self, pts_feats, img_metas, fpsbpts, gt_bboxes_3d=None, gt_bboxes=None, points=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -554,7 +552,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
 
             if pts_feats.requires_grad:
                 reference_points = torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)
-                ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas)
+                ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas, points=points)
                 num_dn_q = mask_dict['pad_size']
 
                 tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:],
