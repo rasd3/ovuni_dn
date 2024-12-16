@@ -2,6 +2,7 @@
 from __future__ import division
 
 import argparse
+import sys
 import copy
 import mmcv
 import os
@@ -103,6 +104,7 @@ def main():
         import_modules_from_strings(**cfg['custom_imports'])
 
     # import modules from plguin/xx, registry will be updated
+    sys.path.insert(0, "./")
     if hasattr(cfg, 'plugin'):
         if cfg.plugin:
             import importlib

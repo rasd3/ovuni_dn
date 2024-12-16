@@ -67,8 +67,9 @@ model = dict(
         with_box_refine=True,
         as_two_stage=False,
         code_size=8,
-        noise_type='jitter',
-        dn_weight=0.25,
+        noise_type='ray',
+        ray_noise_range=[0.7, 1.3],
+        dn_weight=0.1,
         transformer=dict(
             type='Uni3DETRTransformer',
             fp16_enabled=fp16_enabled,
@@ -206,7 +207,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=4,
     workers_per_gpu=4,
     train=dict(
         type='RepeatDataset',

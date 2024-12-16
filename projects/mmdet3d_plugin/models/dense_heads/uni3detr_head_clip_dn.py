@@ -338,6 +338,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                  gt_repeattimes=1,
                  noise_type='jitter',
                  dn_weight=0.5,
+                 ray_noise_range=[0.8, 1.2],
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -381,6 +382,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.split = 0.75
         self.noise_type = noise_type
         self.dn_weight = dn_weight
+        self.ray_noise_range = ray_noise_range
 
 
     def _init_layers(self):
@@ -480,20 +482,20 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             if self.bbox_noise_scale > 0:
                 diff = known_bbox_scale / 2 + self.bbox_noise_trans
                 if self.noise_type == 'jitter':
-                    rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
                     known_bbox_center += torch.mul(rand_prob,
                                                 diff) * self.bbox_noise_scale
+                    rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
+                    mask = torch.norm(rand_prob, 2, 1) > self.split
+                    known_labels[mask] = self.num_classes
                 elif self.noise_type == 'ray':
                     box_centers = boxes[:, :3]
-                    ray_scales = torch.linspace(0.7, 1.3, groups).view(groups, 1, 1)
+                    ray_scales = torch.linspace(self.ray_noise_range[0], self.ray_noise_range[1], groups).view(groups, 1, 1)
                     known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
 
                 known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
                 known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
                 known_bbox_center[..., 2:3] = (known_bbox_center[..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
                 known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)
-                mask = torch.norm(rand_prob, 2, 1) > self.split
-                known_labels[mask] = self.num_classes
 
             single_pad = int(max(known_num))
             pad_size = int(single_pad * groups)
