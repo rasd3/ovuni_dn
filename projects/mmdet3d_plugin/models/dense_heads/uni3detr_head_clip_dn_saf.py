@@ -43,7 +43,6 @@ WEIGHT_INIT_DICT = {
 }
 
 
-
 @HEADS.register_module()
 class Uni3DETRHeadCLIPDNSAF(DETRHead):
     """Head of UVTR. 
@@ -71,6 +70,7 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                  gt_repeattimes=1,
                  noise_type='jitter',
                  dn_weight=0.5,
+                 ray_noise_range=[0.8, 1.2],
                  alpha=0.2,
                  beta=0.45,
                  **kwargs):
@@ -112,11 +112,12 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         self.post_processing = post_processing
         self.gt_repeattimes = gt_repeattimes
 
-        self.bbox_noise_scale = 0.3
+        self.bbox_noise_scale = 1.0
         self.bbox_noise_trans = 0.
         self.split = 0.75
         self.noise_type = noise_type
         self.dn_weight = dn_weight
+        self.ray_noise_range = ray_noise_range
         self.num_base_class = 10
         self.alpha = alpha
         self.beta = beta
@@ -204,6 +205,34 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                 nn.init.constant_(m[-1].bias, bias_init)
 
 
+    def noise_to_query(self, diff, known_bbox_center, known_labels, boxes, groups):
+        if self.noise_type == 'jitter':
+            rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
+            known_bbox_center += torch.mul(rand_prob,
+                                        diff) * self.bbox_noise_scale
+            mask = torch.norm(rand_prob, 2, 1) > self.split
+            known_labels[mask] = self.num_classes
+        elif self.noise_type == 'ray':
+            box_centers = boxes[:, :3]
+            ray_scales = torch.linspace(self.ray_noise_range[0], self.ray_noise_range[1], groups).view(groups, 1, 1)
+            known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
+        elif self.noise_type == 'jit+ray':
+            if torch.rand(1).item() < 0.5:
+                rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
+                known_bbox_center += torch.mul(rand_prob,
+                                            diff) * self.bbox_noise_scale
+                mask = torch.norm(rand_prob, 2, 1) > self.split
+                known_labels[mask] = self.num_classes
+            else:
+                box_centers = boxes[:, :3]
+                ray_scales = torch.linspace(self.ray_noise_range[0], self.ray_noise_range[1], groups).view(groups, 1, 1)
+                known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
+        else:
+            raise NotImplementedError
+
+        return known_bbox_center, known_labels
+
+
     def prepare_for_dn_cmt(self, batch_size, reference_points, img_metas, points=None):
         if self.training:
             targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
@@ -230,16 +259,7 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             
             if self.bbox_noise_scale > 0:
                 diff = known_bbox_scale / 2 + self.bbox_noise_trans
-                if self.noise_type == 'jitter':
-                    rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
-                    known_bbox_center += torch.mul(rand_prob,
-                                                diff) * self.bbox_noise_scale
-                    mask = torch.norm(rand_prob, 2, 1) > self.split
-                    known_labels[mask] = self.num_classes
-                elif self.noise_type == 'ray':
-                    box_centers = boxes[:, :3]
-                    ray_scales = torch.linspace(0.7, 1.3, groups).view(groups, 1, 1)
-                    known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
+                known_bbox_center, known_labels = self.noise_to_query(diff, known_bbox_center, known_labels, boxes, groups)
 
                 known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
                 known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
@@ -469,12 +489,13 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             fused_cls_scores = []
             for cld_cls_scores, opn_cls_scores in zip(cld_outs['all_cls_scores'], opn_outs['all_cls_scores']):
                 # Confidence fusion using geometric mean
+                cld_cls_scores, opn_cls_scores = cld_cls_scores.sigmoid(), opn_cls_scores.sigmoid()
                 fused_scores = torch.where(
                     base_index[None, :],
                     cld_cls_scores ** (1 - self.alpha) * opn_cls_scores ** self.alpha,
                     cld_cls_scores ** (self.alpha) * opn_cls_scores ** (1 - self.alpha),
                 )
-                fused_cls_scores.append(fused_scores)
+                fused_cls_scores.append(inverse_sigmoid(fused_scores))
 
             cld_outs['all_cls_scores'] = torch.stack(fused_cls_scores)
             return cld_outs
@@ -523,11 +544,11 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         neg_inds = sampling_result.neg_inds
 
         # label targets
-        if pre == 'opn_':
+        if pre == 'opn':
             labels = gt_bboxes.new_full((num_bboxes, ),
                                         self.num_classes,
                                         dtype=torch.long)
-        elif pre == 'cld_':
+        elif pre == 'cld':
             labels = gt_bboxes.new_full((num_bboxes, ),
                                         self.num_base_class,
                                         dtype=torch.long)
@@ -725,7 +746,7 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         batch_idx = mask_dict['batch_idx'].long()
         bid = batch_idx[known_indice]
         known_labels_raw = mask_dict['known_labels_raw']
-        if pre == 'cld_':
+        if pre == 'cld':
             base_mask = known_labels < self.num_base_class
             known_labels = known_labels[base_mask]
             known_bboxs = known_bboxs[base_mask]
@@ -796,8 +817,10 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         iou3d_true = torch.diag(bbox_overlaps_3d(bboxes3d, bbox_targets, coordinate='lidar')).detach()
         loss_iou_pred = torch.sum(F.binary_cross_entropy_with_logits(iou_preds, iou3d_true, reduction='none') * bbox_weights[isnotnan, 0] ) / num_total_pos * 1.2 
 
-        loss_consistency = uncertainty_preds.mean()
-
+        if uncertainty_preds.shape[0] == 0:
+            loss_consistency = torch.zeros_like(loss_cls)
+        else:
+            loss_consistency = uncertainty_preds.mean()
 
         return loss_cls*self.dn_weight, loss_bbox*self.dn_weight, loss_iou*self.dn_weight, loss_iou_pred*self.dn_weight, loss_consistency*self.dn_weight
     
@@ -880,8 +903,7 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
             dim=1).to(device) for gt_bboxes in gt_bboxes_list]
-        for pre, preds_dicts in zip(['opn_', 'cld_'], [ret_dicts['opn_outs'], ret_dicts['cld_outs']]):
-            print(pre)
+        for pre, preds_dicts in zip(['opn', 'cld'], [ret_dicts['opn_outs'], ret_dicts['cld_outs']]):
             all_cls_scores = preds_dicts['all_cls_scores']
             all_iou_preds = preds_dicts['all_iou_preds']
             all_uncertainty_preds = preds_dicts['all_uncertainty_preds']
@@ -895,14 +917,14 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             ]
 
             # calculate class and box loss
-            if pre == 'cld_':
+            if pre == 'cld':
                 all_gt_labels_list, all_gt_bboxes_list = self.convert_opn_to_cld(all_gt_labels_list, all_gt_bboxes_list)
             pre_list = [pre for _ in range(len(all_cls_scores))]
             losses_cls, losses_bbox, losses_iou, losses_iou_pred, losses_consistency = multi_apply(
                 self.loss_single, all_cls_scores, all_bbox_preds, all_iou_preds, all_uncertainty_preds,
                 all_gt_bboxes_list, all_gt_labels_list,
                 all_gt_bboxes_ignore_list, pre_list)
-            if pre == 'opn_':
+            if pre == 'opn':
                 losses_bbox = [torch.zeros_like(losses_bbox[0]) for _ in range(len(losses_bbox))]
 
             # loss from the last decoder layer
@@ -936,16 +958,16 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             # calculate class and box loss
             dn_losses_cls, dn_losses_bbox, dn_losses_iou, dn_losses_iou_pred, dn_losses_consistency = multi_apply(
                 self.dn_loss_single, dn_cls_scores, dn_bbox_preds, dn_iou_preds, dn_uncertainty_preds, dn_mask_dict, pre_list)
-            if pre == 'opn_':
+            if pre == 'opn':
                 dn_losses_bbox = [torch.zeros_like(dn_losses_bbox[0]) for _ in range(len(dn_losses_bbox))]
 
             # loss from the last decoder layer
-            loss_dict['{pre}_dn_loss_cls'] = dn_losses_cls[-1]
+            loss_dict[f'{pre}_dn_loss_cls'] = dn_losses_cls[-1]
             if pre == 'cld':
-                loss_dict['{pre}_dn_loss_bbox'] = dn_losses_bbox[-1]
-            loss_dict['{pre}_dn_loss_iou'] = dn_losses_iou[-1]
-            loss_dict['{pre}_dn_loss_iou_pred'] = dn_losses_iou_pred[-1]
-            loss_dict['{pre}_dn_loss_consistency'] = dn_losses_consistency[-1]
+                loss_dict[f'{pre}_dn_loss_bbox'] = dn_losses_bbox[-1]
+            loss_dict[f'{pre}_dn_loss_iou'] = dn_losses_iou[-1]
+            loss_dict[f'{pre}_dn_loss_iou_pred'] = dn_losses_iou_pred[-1]
+            loss_dict[f'{pre}_dn_loss_consistency'] = dn_losses_consistency[-1]
 
             # loss from other decoder layers
             num_dec_layer = 0

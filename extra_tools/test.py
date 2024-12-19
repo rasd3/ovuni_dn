@@ -4,6 +4,7 @@ import mmcv
 import os
 import torch
 import warnings
+import sys
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
@@ -122,6 +123,7 @@ def main():
         import_modules_from_strings(**cfg['custom_imports'])
 
     # import modules from plguin/xx, registry will be updated
+    sys.path.insert(0, "./")
     if hasattr(cfg, 'plugin'):
         if cfg.plugin:
             import importlib
