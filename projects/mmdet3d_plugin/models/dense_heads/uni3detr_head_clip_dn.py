@@ -337,7 +337,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                  post_processing=None,
                  gt_repeattimes=1,
                  noise_type='jitter',
-                 dn_weight=0.5,
+                 dn_weight=0.05,
                  ray_noise_range=[0.8, 1.2],
                  **kwargs):
         self.with_box_refine = with_box_refine
@@ -377,7 +377,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.post_processing = post_processing
         self.gt_repeattimes = gt_repeattimes
 
-        self.bbox_noise_scale = 0.3
+        self.bbox_noise_scale = 1.0
         self.bbox_noise_trans = 0.
         self.split = 0.75
         self.noise_type = noise_type
@@ -455,6 +455,34 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                 nn.init.constant_(m[-1].bias, bias_init)
 
 
+    def noise_to_query(self, diff, known_bbox_center, known_labels, boxes, groups):
+        if self.noise_type == 'jitter':
+            rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
+            known_bbox_center += torch.mul(rand_prob,
+                                        diff) * self.bbox_noise_scale
+            mask = torch.norm(rand_prob, 2, 1) > self.split
+            known_labels[mask] = self.num_classes
+        elif self.noise_type == 'ray':
+            box_centers = boxes[:, :3]
+            ray_scales = torch.linspace(self.ray_noise_range[0], self.ray_noise_range[1], groups).view(groups, 1, 1)
+            known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
+        elif self.noise_type == 'jit+ray':
+            if torch.rand(1).item() < 0.5:
+                rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
+                known_bbox_center += torch.mul(rand_prob,
+                                            diff) * self.bbox_noise_scale
+                mask = torch.norm(rand_prob, 2, 1) > self.split
+                known_labels[mask] = self.num_classes
+            else:
+                box_centers = boxes[:, :3]
+                ray_scales = torch.linspace(self.ray_noise_range[0], self.ray_noise_range[1], groups).view(groups, 1, 1)
+                known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
+        else:
+            raise NotImplementedError
+
+        return known_bbox_center, known_labels
+
+
     def prepare_for_dn_cmt(self, batch_size, reference_points, img_metas, points=None):
         if self.training:
             targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
@@ -481,16 +509,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             
             if self.bbox_noise_scale > 0:
                 diff = known_bbox_scale / 2 + self.bbox_noise_trans
-                if self.noise_type == 'jitter':
-                    known_bbox_center += torch.mul(rand_prob,
-                                                diff) * self.bbox_noise_scale
-                    rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
-                    mask = torch.norm(rand_prob, 2, 1) > self.split
-                    known_labels[mask] = self.num_classes
-                elif self.noise_type == 'ray':
-                    box_centers = boxes[:, :3]
-                    ray_scales = torch.linspace(self.ray_noise_range[0], self.ray_noise_range[1], groups).view(groups, 1, 1)
-                    known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
+                known_bbox_center, known_labels = self.noise_to_query(diff, known_bbox_center, known_labels, boxes, groups)
 
                 known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
                 known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
