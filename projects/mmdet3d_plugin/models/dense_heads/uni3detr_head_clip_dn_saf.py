@@ -22,7 +22,7 @@ from mmcv.ops import nms3d, nms_bev
 from mmdet3d.core.bbox import Box3DMode, CameraInstance3DBoxes, points_cam2img, DepthInstance3DBoxes, LiDARInstance3DBoxes
 from mmdet3d.models.fusion_layers.coord_transform import coord_2d_transform, apply_3d_transformation
 from mmcv.ops import diff_iou_rotated_3d, box_iou_rotated
-from projects.mmdet3d_plugin.models.dense_heads.uni3detr_head_clip_dn import MLP, BatchNormDim1Swap, GenericMLP, shift_scale_points, PositionEmbeddingCoordsSine
+from projects.mmdet3d_plugin.models.dense_heads.uni3detr_head_clip_dn import MLP, BatchNormDim1Swap, GenericMLP, shift_scale_points, PositionEmbeddingCoordsSine, noise_to_query
 
 
 NORM_DICT = {
@@ -205,34 +205,6 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                 nn.init.constant_(m[-1].bias, bias_init)
 
 
-    def noise_to_query(self, diff, known_bbox_center, known_labels, boxes, groups):
-        if self.noise_type == 'jitter':
-            rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
-            known_bbox_center += torch.mul(rand_prob,
-                                        diff) * self.bbox_noise_scale
-            mask = torch.norm(rand_prob, 2, 1) > self.split
-            known_labels[mask] = self.num_classes
-        elif self.noise_type == 'ray':
-            box_centers = boxes[:, :3]
-            ray_scales = torch.linspace(self.ray_noise_range[0], self.ray_noise_range[1], groups).view(groups, 1, 1)
-            known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
-        elif self.noise_type == 'jit+ray':
-            if torch.rand(1).item() < 0.5:
-                rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
-                known_bbox_center += torch.mul(rand_prob,
-                                            diff) * self.bbox_noise_scale
-                mask = torch.norm(rand_prob, 2, 1) > self.split
-                known_labels[mask] = self.num_classes
-            else:
-                box_centers = boxes[:, :3]
-                ray_scales = torch.linspace(self.ray_noise_range[0], self.ray_noise_range[1], groups).view(groups, 1, 1)
-                known_bbox_center = (box_centers.unsqueeze(0) * ray_scales).reshape(-1, 3)
-        else:
-            raise NotImplementedError
-
-        return known_bbox_center, known_labels
-
-
     def prepare_for_dn_cmt(self, batch_size, reference_points, img_metas, points=None):
         if self.training:
             targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
@@ -258,8 +230,13 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             known_bbox_scale = known_bboxs[:, 3:6].clone()
             
             if self.bbox_noise_scale > 0:
-                diff = known_bbox_scale / 2 + self.bbox_noise_trans
-                known_bbox_center, known_labels = self.noise_to_query(diff, known_bbox_center, known_labels, boxes, groups)
+                known_bbox_center, known_labels = noise_to_query(self.noise_type,
+                                                                 known_bbox_center, known_bbox_scale, 
+                                                                 known_labels, boxes, groups,
+                                                                 self.bbox_noise_trans,
+                                                                 self.bbox_noise_scale,
+                                                                 self.split, self.num_classes,
+                                                                 ray_noise_range=self.ray_noise_range)
 
                 known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
                 known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
@@ -276,7 +253,8 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                 map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
                 map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(groups)]).long()
             if len(known_bid):
-                padded_reference_points[(known_bid.long(), map_known_indice)] = known_bbox_center.to(reference_points.device)
+                num_ref_points = reference_points.shape[1]
+                padded_reference_points[(known_bid.long(), map_known_indice + num_ref_points)] = known_bbox_center.to(reference_points.device)
 
             tgt_size = pad_size + self.num_query
             attn_mask = None
