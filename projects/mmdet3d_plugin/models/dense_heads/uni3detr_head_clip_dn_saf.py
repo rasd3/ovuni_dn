@@ -73,6 +73,7 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                  ray_noise_range=[0.8, 1.2],
                  alpha=0.2,
                  beta=0.45,
+                 bbox_noise_scale=0.3,
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -112,7 +113,7 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         self.post_processing = post_processing
         self.gt_repeattimes = gt_repeattimes
 
-        self.bbox_noise_scale = 1.0
+        self.bbox_noise_scale = bbox_noise_scale
         self.bbox_noise_trans = 0.
         self.split = 0.75
         self.noise_type = noise_type

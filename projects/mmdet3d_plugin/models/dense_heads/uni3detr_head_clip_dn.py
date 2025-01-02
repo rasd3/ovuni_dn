@@ -189,22 +189,18 @@ def noise_to_query(noise_type,
         rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
         known_bbox_center += torch.mul(rand_prob,
                                     diff) * bbox_noise_scale
-        mask = torch.norm(rand_prob, 2, 1) > split
-        known_labels[mask] = num_classes
     elif noise_type == 'ray':
         box_centers = boxes[:, :3]
         box_sizes = boxes[:, 3:6]
         ray_directions = box_centers / box_centers.norm(dim=1, keepdim=True)
         random_scales = torch.rand(groups, boxes.size(0), 1) * 2 - 1
         scaled_offsets = ray_directions.unsqueeze(0) * (random_scales * box_sizes.unsqueeze(0)) * bbox_noise_scale
-        known_bbox_center = scaled_offsets.reshape(-1, 3) + box_centers
+        known_bbox_center = (scaled_offsets + box_centers).reshape(-1, 3)
     elif noise_type == 'jit+ray':
         if torch.rand(1).item() < 0.5:
             rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
             known_bbox_center += torch.mul(rand_prob,
                                         diff) * bbox_noise_scale
-            mask = torch.norm(rand_prob, 2, 1) > split
-            known_labels[mask] = num_classes
         else:
             box_centers = boxes[:, :3]
             ray_scales = torch.linspace(ray_noise_range[0], ray_noise_range[1], groups).view(groups, 1, 1)
@@ -373,6 +369,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                  noise_type='jitter',
                  dn_weight=0.05,
                  ray_noise_range=[0.8, 1.2],
+                 bbox_noise_scale=0.3,
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -411,7 +408,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.post_processing = post_processing
         self.gt_repeattimes = gt_repeattimes
 
-        self.bbox_noise_scale = 1.0
+        self.bbox_noise_scale = bbox_noise_scale
         self.bbox_noise_trans = 0.
         self.split = 0.75
         self.noise_type = noise_type
