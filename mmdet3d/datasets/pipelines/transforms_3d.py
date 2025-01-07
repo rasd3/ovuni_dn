@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import random
 import warnings
+import copy
 
 import cv2
 import numpy as np
@@ -962,6 +963,10 @@ class PointsRangeFilter(object):
         points = input_dict['points']
         points_mask = points.in_range_3d(self.pcd_range)
         clean_points = points[points_mask]
+        if clean_points.shape[0] == 0:
+            clean_points = copy.deepcopy(points)
+            clean_points[0].tensor[:] = 0.
+            clean_points = clean_points[:1]
         input_dict['points'] = clean_points
         points_mask = points_mask.numpy()
 

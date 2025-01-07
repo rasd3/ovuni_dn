@@ -3,6 +3,7 @@ import mmcv
 import numpy as np
 import pyquaternion
 import tempfile
+import torch
 from nuscenes.utils.data_classes import Box as NuScenesBox
 from os import path as osp
 
@@ -149,6 +150,28 @@ class SUNRGBDDataset_OV_pklpkl(SUNRGBDDataset):
         self.classes = seen_classes
 
         self.data_infos_pl = self.load_annotations(pl_ann_file)
+
+    def convert_pl_to_det(self, pl_annos):
+        for idx in range(len(pl_annos)):
+            if 'annos' in pl_annos[idx]:
+                if pl_annos[idx]['annos']['gt_num'] == 0:
+                    pl_annos[idx]['labels_3d'] = torch.tensor([], dtype=torch.int64)
+                    pl_annos[idx]['boxes_3d'] = torch.tensor([], dtype=torch.float32).reshape(0, 7)
+                    pl_annos[idx]['scores_3d'] = torch.tensor([], dtype=torch.float32)
+                else:
+                    pl_annos[idx]['labels_3d'] = torch.tensor(pl_annos[idx]['annos']['class'], dtype=torch.int64)
+                    pl_annos[idx]['boxes_3d'] = torch.tensor(pl_annos[idx]['annos']['gt_boxes_upright_depth'], dtype=torch.float32)
+                    pl_annos[idx]['scores_3d'] = torch.ones_like(pl_annos[idx]['labels_3d'], dtype=torch.float32)
+            else:
+                if pl_annos[idx]['gt_num'] == 0:
+                    pl_annos[idx]['labels_3d'] = torch.tensor([], dtype=torch.int64)
+                    pl_annos[idx]['boxes_3d'] = torch.tensor([], dtype=torch.float32).reshape(0, 7)
+                    pl_annos[idx]['scores_3d'] = torch.tensor([], dtype=torch.float32)
+                else:
+                    pl_annos[idx]['labels_3d'] = torch.tensor(pl_annos[idx]['class'], dtype=torch.int64)
+                    pl_annos[idx]['boxes_3d'] = torch.tensor(pl_annos[idx]['gt_boxes_upright_depth'], dtype=torch.float32)
+                    pl_annos[idx]['scores_3d'] = torch.ones_like(pl_annos[idx]['labels_3d'], dtype=torch.float32)
+        return pl_annos
     
     def evaluate(self,
                  metric=None,
@@ -183,11 +206,12 @@ class SUNRGBDDataset_OV_pklpkl(SUNRGBDDataset):
         assert len(self.data_infos_pl) == len(self.data_infos)
         gt_annos = [info['annos'] for info in self.data_infos]
         pl_annos = [info['annos'] for info in self.data_infos_pl]
+        pl_annos_cvt = self.convert_pl_to_det(pl_annos)
         label2cat = {i: cat_id for i, cat_id in enumerate(self.CLASSES)}
-        ret_dict = indoor_eval_ov(
+        ret_dict = indoor_eval_ov_pklpkl(
             self.seen_classes,
             gt_annos,
-            results,
+            pl_annos,
             iou_thr,
             label2cat,
             logger=logger,

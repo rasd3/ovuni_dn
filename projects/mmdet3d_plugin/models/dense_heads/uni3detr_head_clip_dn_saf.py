@@ -910,9 +910,9 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             loss_dict[f'{pre}_loss_cls'] = losses_cls[-1]
             if pre == 'cld':
                 loss_dict[f'{pre}_loss_bbox'] = losses_bbox[-1]
-                loss_dict[f'{pre}_loss_iou'] = losses_iou[-1]
-                loss_dict[f'{pre}_loss_iou_pred'] = losses_iou_pred[-1]
-                loss_dict[f'{pre}_loss_consistency'] = losses_consistency[-1]
+            loss_dict[f'{pre}_loss_iou'] = losses_iou[-1]
+            loss_dict[f'{pre}_loss_iou_pred'] = losses_iou_pred[-1]
+            loss_dict[f'{pre}_loss_consistency'] = losses_consistency[-1]
 
             # loss from other decoder layers
             num_dec_layer = 0
@@ -920,9 +920,9 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                 loss_dict[f'{pre}_d{num_dec_layer}.loss_cls'] = loss_cls_i
                 if pre == 'cld':
                     loss_dict[f'{pre}_d{num_dec_layer}.loss_bbox'] = loss_bbox_i
-                    loss_dict[f'{pre}_d{num_dec_layer}.loss_iou'] = loss_iou_i
-                    loss_dict[f'{pre}_d{num_dec_layer}.loss_iou_pred'] = loss_iou_pred_i
-                    loss_dict[f'{pre}_d{num_dec_layer}.loss_consistency'] = loss_consistency_i
+                loss_dict[f'{pre}_d{num_dec_layer}.loss_iou'] = loss_iou_i
+                loss_dict[f'{pre}_d{num_dec_layer}.loss_iou_pred'] = loss_iou_pred_i
+                loss_dict[f'{pre}_d{num_dec_layer}.loss_consistency'] = loss_consistency_i
                 num_dec_layer += 1
                 
             # for dn queries
@@ -944,9 +944,9 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             loss_dict[f'{pre}_dn_loss_cls'] = dn_losses_cls[-1]
             if pre == 'cld':
                 loss_dict[f'{pre}_dn_loss_bbox'] = dn_losses_bbox[-1]
-                loss_dict[f'{pre}_dn_loss_iou'] = dn_losses_iou[-1]
-                loss_dict[f'{pre}_dn_loss_iou_pred'] = dn_losses_iou_pred[-1]
-                loss_dict[f'{pre}_dn_loss_consistency'] = dn_losses_consistency[-1]
+            loss_dict[f'{pre}_dn_loss_iou'] = dn_losses_iou[-1]
+            loss_dict[f'{pre}_dn_loss_iou_pred'] = dn_losses_iou_pred[-1]
+            loss_dict[f'{pre}_dn_loss_consistency'] = dn_losses_consistency[-1]
 
             # loss from other decoder layers
             num_dec_layer = 0
@@ -954,9 +954,9 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                 loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_cls'] = loss_cls_i
                 if pre == 'cld':
                     loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
-                    loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_iou'] = loss_iou_i
-                    loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_iou_pred'] = loss_iou_pred_i
-                    loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_consistency'] = loss_consistency_i
+                loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_iou'] = loss_iou_i
+                loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_iou_pred'] = loss_iou_pred_i
+                loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_consistency'] = loss_consistency_i
                 num_dec_layer += 1
 
         return loss_dict

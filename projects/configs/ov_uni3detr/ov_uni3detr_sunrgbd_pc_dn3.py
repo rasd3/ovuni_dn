@@ -58,7 +58,7 @@ model = dict(
         extra_conv=dict(type='Conv3d', num_conv=3, bias=False),
         use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='Uni3DETRHeadCLIP',
+        type='Uni3DETRHeadCLIPDN',
         num_query=300,
         zeroshot_path='clip_embed/sunrgbd_clip_a+cname_rn50_manyprompt_46c_coda.npy',
         num_classes=46,
@@ -67,6 +67,9 @@ model = dict(
         with_box_refine=True,
         as_two_stage=False,
         code_size=8,
+        noise_type='jitter',
+        dn_weight=0.4,
+        bbox_noise_scale=0.3,
         transformer=dict(
             type='Uni3DETRTransformer',
             fp16_enabled=fp16_enabled,
@@ -141,18 +144,16 @@ model = dict(
             pc_range=point_cloud_range))))
 
 
-dataset_type = 'SUNRGBDDataset_OV_pklpkl'
+dataset_type = 'SUNRGBDDataset_OV'
 data_root = 'data/sunrgbd/'
-class_names = ('chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'box',
-              'lamp', 'garbage_bin', 'cabinet', 'shelf', 'drawer', 'sink', 'night_stand', 'kitchen_counter',
-              'paper', 'end_table', 'kitchen_cabinet', 'picture', 'book', 'stool', 'coffee_table', 'bookshelf',
-              'painting', 'key_board', 'dresser', 'tv', 'whiteboard', 'cpu', 'toilet', 'file_cabinet', 'bench',
-              'ottoman', 'plant', 'monitor', 'printer', 'recycle_bin', 'door', 'fridge', 'towel', 'cup', 'mirror',
+class_names = ('chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'box', 
+              'lamp', 'garbage_bin', 'cabinet', 'shelf', 'drawer', 'sink', 'night_stand', 'kitchen_counter', 
+              'paper', 'end_table', 'kitchen_cabinet', 'picture', 'book', 'stool', 'coffee_table', 'bookshelf', 
+              'painting', 'key_board', 'dresser', 'tv', 'whiteboard', 'cpu', 'toilet', 'file_cabinet', 'bench', 
+              'ottoman', 'plant', 'monitor', 'printer', 'recycle_bin', 'door', 'fridge', 'towel', 'cup', 'mirror', 
               'laptop', 'cloth')
-#
+
 seen_classes = ('chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'lamp', 'box')
-#  class_names = ['chair', 'table', 'pillow', 'desk', 'bed', 'sofa', 'lamp', 'garbage_bin', 'cabinet', 'sink', 'night_stand', 'stool', 'bookshelf', 'dresser', 'toilet', 'fridge', 'microwave', 'counter', 'bathtub', 'scanner']
-#  seen_classes = ['chair', 'table', 'pillow', 'desk', 'bed', 'sofa', 'lamp', 'garbage_bin', 'cabinet', 'sink', 'night_stand', 'stool', 'bookshelf', 'dresser', 'toilet', 'fridge', 'microwave', 'counter', 'bathtub', 'scanner']
 
 file_client_args = dict(backend='disk')
 
@@ -164,7 +165,10 @@ train_pipeline = [
         load_dim=6,
         use_dim=[0, 1, 2],
         file_client_args=file_client_args),
-    dict(type='LoadAnnotations3D'),
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadAnnotations3D',
+         with_bbox=True,
+         ),
     dict(
         type='UnifiedRandomFlip3D',
         sync_2d=False,
@@ -179,7 +183,9 @@ train_pipeline = [
     #  dict(type='PointSample', num_points=20000),
     dict(type='PointSample', num_points=200000),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(type='Collect3D', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'])
+    dict(type='Collect3D', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes'],
+         meta_keys=('gt_bboxes_3d', 'gt_labels_3d')
+         )
 ]
 test_pipeline = [
     dict(
@@ -189,6 +195,7 @@ test_pipeline = [
         load_dim=6,
         use_dim=[0, 1, 2],
         file_client_args=file_client_args),
+    dict(type='LoadImageFromFile'),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     #  dict(type='PointSample', num_points=50000),
     dict(type='PointSample', num_points=200000),
@@ -200,16 +207,15 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=4,
     workers_per_gpu=4,
     train=dict(
         type='RepeatDataset',
-        times=1,
+        times=2,  #######5
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
             ann_file=data_root + 'sunrgbd_infos_train_pls_ens_10c36c.pkl',
-            pl_ann_file=data_root + 'sunrgbd_infos_train_46cls.pkl',
             pipeline=train_pipeline,
             classes=class_names,
             seen_classes=seen_classes,
@@ -219,16 +225,8 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=data_root,
-        #  ann_file=data_root + 'sunrgbd_infos_20c_ov3det_train.pkl',
-        #  pl_ann_file=data_root + 'sunrgbd_infos_20c_ov3det.pkl',
-        #  ann_file=data_root + 'sunrgbd_infos_train_46cls.pkl',
-        ann_file=data_root + 'sunrgbd_infos_train_46cls.pkl',
-        #  pl_ann_file=data_root + 'sunrgbd_infos_train_pls_ens_10c36c.pkl',
-        #  pl_ann_file=data_root + 'train_b_6891_n_2405/sunrgbd_infos_train_pls_ens_10c36c_refined.pkl',
-        pl_ann_file='/shared/workspace/ovuni_dn/pl_ref/train_b_6891_n_2405/sunrgbd_infos_train_pls_ens_10c36c_refined_cat.pkl',
-        #  pl_ann_file=data_root + 'train_b_6891_n_2405/train_b_6891_n_2405.pkl',
-        #  pl_ann_file=data_root + 'sunrgbd_infos_train_pls_ens_10c36c.pkl',
-        #  pl_ann_file=data_root + 'sunrgbd_infos_train.pkl',
+        #  ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
+        ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,
@@ -238,14 +236,8 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        #  ann_file=data_root + 'sunrgbd_infos_20c_ov3det_train.pkl',
-        #  pl_ann_file=data_root + 'sunrgbd_infos_20c_ov3det.pkl',
-        ann_file=data_root + 'sunrgbd_infos_train_46cls.pkl',
-        #  pl_ann_file=data_root + 'sunrgbd_infos_train_pls_ens_10c36c.pkl',
-        #  pl_ann_file=data_root + 'train_b_6891_n_2405/sunrgbd_infos_train_pls_ens_10c36c_refined.pkl',
-        pl_ann_file='/shared/workspace/ovuni_dn/pl_ref/train_b_6891_n_2405/sunrgbd_infos_train_pls_ens_10c36c_refined_cat.pkl',
-        #  pl_ann_file=data_root + 'train_b_6891_n_2405/train_b_6891_n_2405.pkl',
-        #  pl_ann_file=data_root + 'sunrgbd_infos_train.pkl',
+        #  ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
+        ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,
