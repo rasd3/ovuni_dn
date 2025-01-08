@@ -370,6 +370,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                  dn_weight=0.05,
                  ray_noise_range=[0.8, 1.2],
                  bbox_noise_scale=0.3,
+                 num_dn_query=10,
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -414,6 +415,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.noise_type = noise_type
         self.dn_weight = dn_weight
         self.ray_noise_range = ray_noise_range
+        self.num_dn_query = num_dn_query
 
 
     def _init_layers(self):
@@ -487,73 +489,70 @@ class Uni3DETRHeadCLIPDN(DETRHead):
 
 
     def prepare_for_dn_cmt(self, batch_size, reference_points, img_metas, points=None):
-        if self.training:
-            targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
-            labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ]
-            known = [(torch.ones_like(t)).cuda() for t in labels]
-            know_idx = known
-            unmask_bbox = unmask_label = torch.cat(known)
-            known_num = [t.size(0) for t in targets]
-            labels = torch.cat([t for t in labels])
-            boxes = torch.cat([t for t in targets])
-            batch_idx = torch.cat([torch.full((t.size(0), ), i) for i, t in enumerate(targets)])
+        targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
+        labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ]
+        known = [(torch.ones_like(t)).cuda() for t in labels]
+        know_idx = known
+        unmask_bbox = unmask_label = torch.cat(known)
+        known_num = [t.size(0) for t in targets]
+        labels = torch.cat([t for t in labels])
+        boxes = torch.cat([t for t in targets])
+        batch_idx = torch.cat([torch.full((t.size(0), ), i) for i, t in enumerate(targets)])
 
-            known_indice = torch.nonzero(unmask_label + unmask_bbox)
-            known_indice = known_indice.view(-1)
-            # add noise
-            groups = min(10, self.num_query // max(known_num))
-            known_indice = known_indice.repeat(groups, 1).view(-1)
-            known_labels = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
-            known_labels_raw = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
-            known_bid = batch_idx.repeat(groups, 1).view(-1)
-            known_bboxs = boxes.repeat(groups, 1).to(reference_points.device)
-            known_bbox_center = known_bboxs[:, :3].clone()
-            known_bbox_scale = known_bboxs[:, 3:6].clone()
-            
-            if self.bbox_noise_scale > 0:
-                known_bbox_center, known_labels = noise_to_query(self.noise_type, 
-                                                                 known_bbox_center, known_bbox_scale, 
-                                                                 known_labels, boxes, groups,
-                                                                 self.bbox_noise_trans,
-                                                                 self.bbox_noise_scale,
-                                                                 self.split, self.num_classes,
-                                                                 ray_noise_range=self.ray_noise_range)
+        known_indice = torch.nonzero(unmask_label + unmask_bbox)
+        known_indice = known_indice.view(-1)
+        # add noise
+        if max(known_num) == 0:
+            assert self.training == False
+            return reference_points, None, {'pad_size': 0}
+        groups = min(self.num_dn_query, self.num_query // max(known_num))
+        known_indice = known_indice.repeat(groups, 1).view(-1)
+        known_labels = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
+        known_labels_raw = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
+        known_bid = batch_idx.repeat(groups, 1).view(-1)
+        known_bboxs = boxes.repeat(groups, 1).to(reference_points.device)
+        known_bbox_center = known_bboxs[:, :3].clone()
+        known_bbox_scale = known_bboxs[:, 3:6].clone()
 
-                known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
-                known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
-                known_bbox_center[..., 2:3] = (known_bbox_center[..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
-                known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)
+        if self.bbox_noise_scale > 0:
+            known_bbox_center, known_labels = noise_to_query(self.noise_type, 
+                                                             known_bbox_center, known_bbox_scale, 
+                                                             known_labels, boxes, groups,
+                                                             self.bbox_noise_trans,
+                                                             self.bbox_noise_scale,
+                                                             self.split, self.num_classes,
+                                                             ray_noise_range=self.ray_noise_range)
 
-            single_pad = int(max(known_num))
-            pad_size = int(single_pad * groups)
-            padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
-            padding_bbox_repeated = padding_bbox.unsqueeze(0).repeat(batch_size, 1, 1)
-            padded_reference_points = torch.cat([reference_points, padding_bbox_repeated], dim=1)
+            known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
+            known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
+            known_bbox_center[..., 2:3] = (known_bbox_center[..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
+            known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)
 
-            if len(known_num):
-                map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
-                map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(groups)]).long()
-            if len(known_bid):
-                num_ref_points = reference_points.shape[1]
-                padded_reference_points[(known_bid.long(), map_known_indice + num_ref_points)] = known_bbox_center.to(reference_points.device)
+        single_pad = int(max(known_num))
+        pad_size = int(single_pad * groups)
+        padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
+        padding_bbox_repeated = padding_bbox.unsqueeze(0).repeat(batch_size, 1, 1)
+        padded_reference_points = torch.cat([reference_points, padding_bbox_repeated], dim=1)
 
-            tgt_size = pad_size + self.num_query
-            attn_mask = None
+        if len(known_num):
+            map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
+            map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(groups)]).long()
+        if len(known_bid):
+            num_ref_points = reference_points.shape[1]
+            padded_reference_points[(known_bid.long(), map_known_indice + num_ref_points)] = known_bbox_center.to(reference_points.device)
 
-            mask_dict = {
-                'known_indice': torch.as_tensor(known_indice).long(),
-                'batch_idx': torch.as_tensor(batch_idx).long(),
-                'map_known_indice': torch.as_tensor(map_known_indice).long(),
-                'known_lbs_bboxes': (known_labels, known_bboxs),
-                'known_labels_raw': known_labels_raw,
-                'know_idx': know_idx,
-                'pad_size': pad_size
-            }
-            
-        else:
-            padded_reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1)
-            attn_mask = None
-            mask_dict = None
+        tgt_size = pad_size + self.num_query
+        attn_mask = None
+
+        mask_dict = {
+            'known_indice': torch.as_tensor(known_indice).long(),
+            'batch_idx': torch.as_tensor(batch_idx).long(),
+            'map_known_indice': torch.as_tensor(map_known_indice).long(),
+            'known_lbs_bboxes': (known_labels, known_bboxs),
+            'known_labels_raw': known_labels_raw,
+            'know_idx': know_idx,
+            'pad_size': pad_size
+        }
 
         return padded_reference_points, attn_mask, mask_dict
 
@@ -580,11 +579,11 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         if fpsbpts is not None:
             bs = fpsbpts.shape[0]
 
-            if pts_feats.requires_grad:
+            #  if pts_feats.requires_grad:
+            if 'gt_bboxes_3d' in img_metas[0]:
                 reference_points = torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)
                 ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas, points=points)
                 num_dn_q = mask_dict['pad_size']
-
                 tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:],
                                        tgt_embed[self.num_query:self.num_query+num_dn_q]])
 

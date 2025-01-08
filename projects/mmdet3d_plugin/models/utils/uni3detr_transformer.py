@@ -115,6 +115,8 @@ class Uni3DETRTransformer(BaseModule):
         inter_states = []
         inter_references = []
         for g in range(ng):
+            if query[g*nq:(g+1)*nq].shape[0] == 0:
+                continue
             inter_states1, inter_references1 = self.decoder(
                 query=query[g*nq:(g+1)*nq],
                 key=None,

@@ -67,8 +67,10 @@ model = dict(
         with_box_refine=True,
         as_two_stage=False,
         code_size=8,
-        noise_type='jitter',
-        dn_weight=0.25,
+        noise_type='ray',
+        ray_noise_range=[0.6, 1.2],
+        bbox_noise_scale=1.0,
+        dn_weight=0.1,
         transformer=dict(
             type='Uni3DETRTransformer',
             fp16_enabled=fp16_enabled,
@@ -194,6 +196,9 @@ test_pipeline = [
         load_dim=6,
         use_dim=[0, 1, 2],
         file_client_args=file_client_args),
+    dict(type='LoadAnnotations3D',
+         with_bbox=True,
+         ),
     dict(type='LoadImageFromFile'),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     #  dict(type='PointSample', num_points=50000),
@@ -202,7 +207,11 @@ test_pipeline = [
         type='DefaultFormatBundle3D',
         class_names=class_names,
         with_label=False),
-    dict(type='Collect3D', keys=['points'])
+    dict(type='Collect3D', keys=['points'],
+         meta_keys=('gt_bboxes_3d', 'gt_labels_3d', 'filename',
+                    'ori_shape', 'img_shape', 'depth2img', 
+                    'box_mode_3d', 'box_type_3d', 'sample_idx',
+                    'pts_filename'))
 ]
 
 data = dict(
@@ -224,26 +233,24 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=data_root,
-        #  ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
-        #  ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         ann_file=data_root + 'sunrgbd_infos_train_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,
         test_mode=True,
         box_type_3d='Depth',
+        ray_pl=True,
         file_client_args=file_client_args),
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        #  ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
-        #  ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         ann_file=data_root + 'sunrgbd_infos_train_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,
         test_mode=True,
         box_type_3d='Depth',
+        ray_pl=True,
         file_client_args=file_client_args))
 
 evaluation = dict(pipeline=test_pipeline, interval=5)

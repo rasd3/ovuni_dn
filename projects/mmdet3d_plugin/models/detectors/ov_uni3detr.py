@@ -437,7 +437,8 @@ class OV_Uni3DETR(MVXTwoStageDetector):
         pts_feat, fpsbpts = self.extract_feats(points, img_metas, img)
         bbox_list = [dict() for i in range(len(img_metas))]
         bbox_pts = self.simple_test_pts(
-            pts_feat, img_metas, rescale=rescale, fpsbpts=fpsbpts)
+            pts_feat, img_metas, rescale=rescale, fpsbpts=fpsbpts,
+        )
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             # result_dict['pts_bbox'] = pts_bbox
             # result_dict = pts_bbox
@@ -445,6 +446,3 @@ class OV_Uni3DETR(MVXTwoStageDetector):
                 result_dict[k] = pts_bbox[k]
         
         return bbox_list
-
-
-    
