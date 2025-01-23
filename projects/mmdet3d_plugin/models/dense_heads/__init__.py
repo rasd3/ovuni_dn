@@ -3,6 +3,7 @@ from .uni3detr_head_clip import Uni3DETRHeadCLIP
 from .uni3detr_head_clip_cls_agn import Uni3DETRHeadCLIPClsAgn
 from .uni3detr_head_clip_dn import Uni3DETRHeadCLIPDN
 from .uni3detr_head_clip_dn_saf import Uni3DETRHeadCLIPDNSAF
+from .uni3detr_head_clip_dn_safv2 import Uni3DETRHeadCLIPDNSAFv2
 
 __all__ = ['Uni3DETRHead', 'Uni3DETRHeadCLIP', 'Uni3DETRHeadCLIPClsAgn',
-           'Uni3DETRHeadCLIPDN', 'Uni3DETRHeadCLIPDNSAF']
+           'Uni3DETRHeadCLIPDN', 'Uni3DETRHeadCLIPDNSAF', 'Uni3DETRHeadCLIPDNSAFv2']

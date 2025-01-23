@@ -70,10 +70,14 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                  gt_repeattimes=1,
                  noise_type='jitter',
                  dn_weight=0.5,
-                 ray_noise_range=[0.8, 1.2],
+                 ray_noise_range=[-0.3, 0.3],
                  alpha=0.2,
                  beta=0.45,
                  bbox_noise_scale=0.3,
+                 bbox_loss_reweight=False,
+                 bbox_novel_weight=1.0,
+                 num_dn_query=10,
+                 cyl_div_factor=4.,
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -122,6 +126,10 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         self.num_base_class = 10
         self.alpha = alpha
         self.beta = beta
+        self.bbox_loss_reweight = bbox_loss_reweight
+        self.bbox_novel_weight = bbox_novel_weight
+        self.num_dn_query = num_dn_query
+        self.cyl_div_factor = cyl_div_factor
 
 
     def _init_layers(self):
@@ -221,7 +229,7 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             known_indice = torch.nonzero(unmask_label + unmask_bbox)
             known_indice = known_indice.view(-1)
             # add noise
-            groups = min(10, self.num_query // max(known_num))
+            groups = min(self.num_dn_query, self.num_query // max(known_num))
             known_indice = known_indice.repeat(groups, 1).view(-1)
             known_labels = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
             known_labels_raw = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
@@ -237,7 +245,8 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                                                                  self.bbox_noise_trans,
                                                                  self.bbox_noise_scale,
                                                                  self.split, self.num_classes,
-                                                                 ray_noise_range=self.ray_noise_range)
+                                                                 ray_noise_range=self.ray_noise_range,
+                                                                 cyl_div_factor=self.cyl_div_factor)
 
                 known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
                 known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
@@ -301,15 +310,19 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
             bs = fpsbpts.shape[0]
 
             if pts_feats.requires_grad:
-                reference_points = torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)
-                ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas, points=points)
-                num_dn_q = mask_dict['pad_size']
+                if self.noise_type == 'None':
+                    tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:]])
+                    query_embeds = torch.cat([tgt_embed.unsqueeze(0).expand(bs, -1, -1), torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)], -1)
+                else:
+                    reference_points = torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)
+                    ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas, points=points)
+                    num_dn_q = mask_dict['pad_size']
 
-                tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:],
-                                       tgt_embed[self.num_query:self.num_query+num_dn_q]])
+                    tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:],
+                                           tgt_embed[self.num_query:self.num_query+num_dn_q]])
 
-                # for gt dn
-                query_embeds = torch.cat([tgt_embed.unsqueeze(0).expand(bs, -1, -1), ref_points], -1)
+                    # for gt dn
+                    query_embeds = torch.cat([tgt_embed.unsqueeze(0).expand(bs, -1, -1), ref_points], -1)
             else:
                 random_point = torch.rand(fpsbpts.shape, device=fpsbpts.device)[:, :self.num_query, :]
                 tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:], tgt_embed[self.num_query:]])
@@ -373,16 +386,20 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
 
         if self.training:
             # separate query
-            dn_pad_size = mask_dict['pad_size']
+            total_q = outputs_classes.shape[2]
+            if self.noise_type == 'None':
+                dn_piv = total_q
+            else:
+                dn_piv = total_q - mask_dict['pad_size']
+                opn_outs.update({'dn_mask_dict': mask_dict})
 
             opn_outs.update({
-                'all_cls_scores': outputs_classes[:, :, :-dn_pad_size, :],
-                'all_iou_preds': outputs_ious[:, :, :-dn_pad_size, :],
-                'all_uncertainty_preds': outputs_uncertainties[:, :, :-dn_pad_size, :],
-                'dn_cls_scores': outputs_classes[:, :, -dn_pad_size:, :],
-                'dn_iou_preds': outputs_ious[:, :, -dn_pad_size:, :],
-                'dn_uncertainty_preds': outputs_uncertainties[:, :, -dn_pad_size:, :],
-                'dn_mask_dict': mask_dict
+                'all_cls_scores': outputs_classes[:, :, :dn_piv, :],
+                'all_iou_preds': outputs_ious[:, :, :dn_piv, :],
+                'all_uncertainty_preds': outputs_uncertainties[:, :, :dn_piv, :],
+                'dn_cls_scores': outputs_classes[:, :, dn_piv:, :],
+                'dn_iou_preds': outputs_ious[:, :, dn_piv:, :],
+                'dn_uncertainty_preds': outputs_uncertainties[:, :, dn_piv:, :],
             })
 
         ret_dict.update({'opn_outs': opn_outs})
@@ -443,18 +460,22 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
 
         if self.training:
             # separate query
-            dn_pad_size = mask_dict['pad_size']
+            total_q = outputs_classes.shape[2]
+            if self.noise_type == 'None':
+                dn_piv = total_q
+            else:
+                dn_piv = total_q - mask_dict['pad_size']
+                cld_outs.update({'dn_mask_dict': mask_dict})
 
             cld_outs.update({
-                'all_cls_scores': outputs_classes[:, :, :-dn_pad_size, :],
-                'all_bbox_preds': outputs_coords[:, :, :-dn_pad_size, :],
-                'all_iou_preds': outputs_ious[:, :, :-dn_pad_size, :],
-                'all_uncertainty_preds': outputs_uncertainties[:, :, :-dn_pad_size, :],
-                'dn_cls_scores': outputs_classes[:, :, -dn_pad_size:, :],
-                'dn_bbox_preds': outputs_coords[:, :, -dn_pad_size:, :],
-                'dn_iou_preds': outputs_ious[:, :, -dn_pad_size:, :],
-                'dn_uncertainty_preds': outputs_uncertainties[:, :, -dn_pad_size:, :],
-                'dn_mask_dict': mask_dict
+                'all_cls_scores': outputs_classes[:, :, :dn_piv, :],
+                'all_bbox_preds': outputs_coords[:, :, :dn_piv, :],
+                'all_iou_preds': outputs_ious[:, :, :dn_piv, :],
+                'all_uncertainty_preds': outputs_uncertainties[:, :, :dn_piv, :],
+                'dn_cls_scores': outputs_classes[:, :, dn_piv:, :],
+                'dn_bbox_preds': outputs_coords[:, :, dn_piv:, :],
+                'dn_iou_preds': outputs_ious[:, :, dn_piv:, :],
+                'dn_uncertainty_preds': outputs_uncertainties[:, :, dn_piv:, :],
             })
 
         ret_dict.update({'cld_outs': cld_outs})
@@ -477,6 +498,7 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                 fused_cls_scores.append(inverse_sigmoid(fused_scores))
 
             cld_outs['all_cls_scores'] = torch.stack(fused_cls_scores)
+            #  cld_outs['all_cls_scores'] = opn_outs['all_cls_scores']
             return cld_outs
 
         ret_dict.update({'cld_outs': cld_outs, 'opn_outs': opn_outs})
@@ -678,6 +700,11 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
         bbox_weights = bbox_weights * self.code_weights
         
+        if self.bbox_loss_reweight:
+            box_base_inds = ((labels != self.num_classes) & (labels < self.num_base_class)).nonzero().squeeze()
+            box_novel_inds = ((labels != self.num_classes) & (labels >= self.num_base_class)).nonzero().squeeze()
+            bbox_weights[box_novel_inds] *= self.bbox_novel_weight
+
         # loss_bbox = self.loss_bbox(bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
         loss_bbox = self.loss_bbox(bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10] * uncertainty_exp, avg_factor=num_total_pos)
 
@@ -786,6 +813,11 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
         bbox_weights = bbox_weights * self.code_weights
         
+        if self.bbox_loss_reweight:
+            box_base_inds = ((labels != self.num_classes) & (labels < self.num_base_class)).nonzero().squeeze()
+            box_novel_inds = ((labels != self.num_classes) & (labels >= self.num_base_class)).nonzero().squeeze()
+            bbox_weights[box_novel_inds] *= self.bbox_novel_weight
+
         loss_bbox = self.loss_bbox(bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10] * uncertainty_exp, avg_factor=num_total_pos)
 
         loss_iou_z = 1 - iou_z[isnotnan]
@@ -925,6 +957,9 @@ class Uni3DETRHeadCLIPDNSAF(DETRHead):
                 loss_dict[f'{pre}_d{num_dec_layer}.loss_consistency'] = loss_consistency_i
                 num_dec_layer += 1
                 
+            if self.noise_type == 'None':
+                continue
+
             # for dn queries
             dn_cls_scores = preds_dicts['dn_cls_scores']
             dn_iou_preds = preds_dicts['dn_iou_preds']

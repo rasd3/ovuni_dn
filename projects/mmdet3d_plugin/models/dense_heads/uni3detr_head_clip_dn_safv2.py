@@ -1,5 +1,4 @@
 import copy
-import copy
 from functools import partial
 import math
 import numpy as np
@@ -23,40 +22,7 @@ from mmcv.ops import nms3d, nms_bev
 from mmdet3d.core.bbox import Box3DMode, CameraInstance3DBoxes, points_cam2img, DepthInstance3DBoxes, LiDARInstance3DBoxes
 from mmdet3d.models.fusion_layers.coord_transform import coord_2d_transform, apply_3d_transformation
 from mmcv.ops import diff_iou_rotated_3d, box_iou_rotated
-
-class MLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
-
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
-
-
-class BatchNormDim1Swap(nn.BatchNorm1d):
-    """
-    Used for nn.Transformer that uses a HW x N x C rep
-    """
-
-    def forward(self, x):
-        """
-        x: HW x N x C
-        permute to N x C x HW
-        Apply BN on C
-        permute back
-        """
-        hw, n, c = x.shape
-        x = x.permute(1, 2, 0)
-        x = super(BatchNormDim1Swap, self).forward(x)
-        # x: n x c x hw -> hw x n x c
-        x = x.permute(2, 0, 1)
-        return x
+from projects.mmdet3d_plugin.models.dense_heads.uni3detr_head_clip_dn import MLP, BatchNormDim1Swap, GenericMLP, shift_scale_points, PositionEmbeddingCoordsSine, noise_to_query
 
 
 NORM_DICT = {
@@ -77,293 +43,8 @@ WEIGHT_INIT_DICT = {
 }
 
 
-class GenericMLP(nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        hidden_dims,
-        output_dim,
-        norm_fn_name=None,
-        activation="relu",
-        use_conv=False,
-        dropout=None,
-        hidden_use_bias=False,
-        output_use_bias=True,
-        output_use_activation=False,
-        output_use_norm=False,
-        weight_init_name=None,
-    ):
-        super().__init__()
-        activation = ACTIVATION_DICT[activation]
-        norm = None
-        if norm_fn_name is not None:
-            norm = NORM_DICT[norm_fn_name]
-        if norm_fn_name == "ln" and use_conv:
-            norm = lambda x: nn.GroupNorm(1, x)  # easier way to use LayerNorm
-
-        if dropout is not None:
-            if not isinstance(dropout, list):
-                dropout = [dropout for _ in range(len(hidden_dims))]
-
-        layers = []
-        prev_dim = input_dim
-        for idx, x in enumerate(hidden_dims):
-            if use_conv:
-                layer = nn.Conv1d(prev_dim, x, 1, bias=hidden_use_bias)
-            else:
-                layer = nn.Linear(prev_dim, x, bias=hidden_use_bias)
-            layers.append(layer)
-            if norm:
-                layers.append(norm(x))
-            layers.append(activation())
-            if dropout is not None:
-                layers.append(nn.Dropout(p=dropout[idx]))
-            prev_dim = x
-        if use_conv:
-            layer = nn.Conv1d(prev_dim, output_dim, 1, bias=output_use_bias)
-        else:
-            layer = nn.Linear(prev_dim, output_dim, bias=output_use_bias)
-        layers.append(layer)
-
-        if output_use_norm:
-            layers.append(norm(output_dim))
-
-        if output_use_activation:
-            layers.append(activation())
-
-        self.layers = nn.Sequential(*layers)
-
-        if weight_init_name is not None:
-            self.do_weight_init(weight_init_name)
-
-    def do_weight_init(self, weight_init_name):
-        func = WEIGHT_INIT_DICT[weight_init_name]
-        for (_, param) in self.named_parameters():
-            if param.dim() > 1:  # skips batchnorm/layernorm
-                func(param)
-
-    def forward(self, x):
-        output = self.layers(x)
-        return output
-
-# ----------------------------------------
-# Simple Point manipulations
-# ----------------------------------------
-def shift_scale_points(pred_xyz, src_range, dst_range=None):
-    """
-    pred_xyz: B x N x 3
-    src_range: [[B x 3], [B x 3]] - min and max XYZ coords
-    dst_range: [[B x 3], [B x 3]] - min and max XYZ coords
-    """
-    if dst_range is None:
-        dst_range = [
-            torch.zeros((src_range[0].shape[0], 3), device=src_range[0].device),
-            torch.ones((src_range[0].shape[0], 3), device=src_range[0].device),
-        ]
-
-    if pred_xyz.ndim == 4:
-        src_range = [x[:, None] for x in src_range]
-        dst_range = [x[:, None] for x in dst_range]
-
-    assert src_range[0].shape[0] == pred_xyz.shape[0]
-    assert dst_range[0].shape[0] == pred_xyz.shape[0]
-    assert src_range[0].shape[-1] == pred_xyz.shape[-1]
-    assert src_range[0].shape == src_range[1].shape
-    assert dst_range[0].shape == dst_range[1].shape
-    assert src_range[0].shape == dst_range[1].shape
-
-    src_diff = src_range[1][:, None, :] - src_range[0][:, None, :]
-    dst_diff = dst_range[1][:, None, :] - dst_range[0][:, None, :]
-    prop_xyz = (
-        ((pred_xyz - src_range[0][:, None, :]) * dst_diff) / src_diff
-    ) + dst_range[0][:, None, :]
-    return prop_xyz
-
-def noise_to_query(noise_type, 
-                   known_bbox_center, known_bbox_scale, 
-                   known_labels, boxes, groups, 
-                   bbox_noise_trans, bbox_noise_scale,
-                   split, num_classes, ray_noise_range=None,
-                   cyl_div_factor=None,):
-    diff = known_bbox_scale / 2 + bbox_noise_trans
-    if noise_type == 'jitter':
-        rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
-        known_bbox_center += torch.mul(rand_prob, diff) * bbox_noise_scale
-    elif noise_type == 'jittern':
-        rand_prob = torch.randn_like(known_bbox_center)
-        known_bbox_center += torch.mul(rand_prob, diff) * bbox_noise_scale
-    elif noise_type == 'ray':
-        box_centers = boxes[:, :3]
-        box_sizes = boxes[:, 3:6]
-        ray_directions = box_centers / box_centers.norm(dim=1, keepdim=True)
-        random_scales = torch.rand(groups, boxes.size(0), 1) * (ray_noise_range[1] - ray_noise_range[0]) + ray_noise_range[0]
-        scaled_offsets = ray_directions.unsqueeze(0) * (random_scales * box_sizes.unsqueeze(0))
-        known_bbox_center = (scaled_offsets + box_centers).reshape(-1, 3)
-    elif noise_type == 'jit+ray':
-        if torch.rand(1).item() < 0.5:
-            rand_prob = torch.rand_like(known_bbox_center) * 2 - 1.0
-            known_bbox_center += torch.mul(rand_prob, diff) * bbox_noise_scale
-        else:
-            box_centers = boxes[:, :3]
-            box_sizes = boxes[:, 3:6]
-            ray_directions = box_centers / box_centers.norm(dim=1, keepdim=True)
-            random_scales = torch.rand(groups, boxes.size(0), 1) * (ray_noise_range[1] - ray_noise_range[0]) + ray_noise_range[0]
-            scaled_offsets = ray_directions.unsqueeze(0) * (random_scales * box_sizes.unsqueeze(0))
-            known_bbox_center = (scaled_offsets + box_centers).reshape(-1, 3)
-    elif noise_type == 'cyl':
-        box_centers = boxes[:, :3]
-        box_sizes = boxes[:, 3:6]
-        ray_directions = box_centers / box_centers.norm(dim=1, keepdim=True)
-        
-        random_scales = torch.rand(groups, boxes.size(0), 1) * (ray_noise_range[1] - ray_noise_range[0]) + ray_noise_range[0]
-
-        cylinder_radius = box_sizes.min(dim=1, keepdim=True)[0] / cyl_div_factor
-        random_angles = torch.rand(groups, boxes.size(0), 1) * 2 * torch.pi  # 0 to 2*pi
-        random_radii = torch.sqrt(torch.rand(groups, boxes.size(0), 1)) * cylinder_radius.unsqueeze(0)  # sqrt for uniform distribution in circle
-        offset_x = random_radii * torch.cos(random_angles)
-        offset_y = random_radii * torch.sin(random_angles)
-        cylindrical_offsets = torch.cat([offset_x, offset_y, torch.zeros_like(offset_x)], dim=-1)
-        
-        scaled_offsets = ray_directions.unsqueeze(0) * (random_scales * box_sizes.unsqueeze(0)) + cylindrical_offsets
-        known_bbox_center = (scaled_offsets + box_centers).reshape(-1, 3)
-    else:
-        raise NotImplementedError
-
-    return known_bbox_center, known_labels
-
-class PositionEmbeddingCoordsSine(nn.Module):
-    def __init__(
-        self,
-        temperature=10000,
-        normalize=False,
-        scale=None,
-        pos_type="fourier",
-        d_pos=None,
-        d_in=3,
-        gauss_scale=1.0,
-    ):
-        super().__init__()
-        self.temperature = temperature
-        self.normalize = normalize
-        if scale is not None and normalize is False:
-            raise ValueError("normalize should be True if scale is passed")
-        if scale is None:
-            scale = 2 * math.pi
-        assert pos_type in ["sine", "fourier"]
-        self.pos_type = pos_type
-        self.scale = scale
-        if pos_type == "fourier":
-            assert d_pos is not None
-            assert d_pos % 2 == 0
-            # define a gaussian matrix input_ch -> output_ch
-            B = torch.empty((d_in, d_pos // 2)).normal_()
-            B *= gauss_scale
-            self.register_buffer("gauss_B", B)
-            self.d_pos = d_pos
-
-    def get_sine_embeddings(self, xyz, num_channels, input_range):
-        # clone coords so that shift/scale operations do not affect original tensor
-        orig_xyz = xyz
-        xyz = orig_xyz.clone()
-
-        ncoords = xyz.shape[1]
-        if self.normalize:
-            xyz = shift_scale_points(xyz, src_range=input_range)
-
-        ndim = num_channels // xyz.shape[2]
-        if ndim % 2 != 0:
-            ndim -= 1
-        # automatically handle remainder by assiging it to the first dim
-        rems = num_channels - (ndim * xyz.shape[2])
-
-        assert (
-            ndim % 2 == 0
-        ), f"Cannot handle odd sized ndim={ndim} where num_channels={num_channels} and xyz={xyz.shape}"
-
-        final_embeds = []
-        prev_dim = 0
-
-        for d in range(xyz.shape[2]):
-            cdim = ndim
-            if rems > 0:
-                # add remainder in increments of two to maintain even size
-                cdim += 2
-                rems -= 2
-
-            if cdim != prev_dim:
-                dim_t = torch.arange(cdim, dtype=torch.float32, device=xyz.device)
-                dim_t = self.temperature ** (2 * (dim_t // 2) / cdim)
-
-            # create batch x cdim x nccords embedding
-            raw_pos = xyz[:, :, d]
-            if self.scale:
-                raw_pos *= self.scale
-            pos = raw_pos[:, :, None] / dim_t
-            pos = torch.stack(
-                (pos[:, :, 0::2].sin(), pos[:, :, 1::2].cos()), dim=3
-            ).flatten(2)
-            final_embeds.append(pos)
-            prev_dim = cdim
-
-        final_embeds = torch.cat(final_embeds, dim=2).permute(0, 2, 1)
-        return final_embeds
-
-    def get_fourier_embeddings(self, xyz, num_channels=None, input_range=None):
-        # Follows - https://people.eecs.berkeley.edu/~bmild/fourfeat/index.html
-
-        if num_channels is None:
-            num_channels = self.gauss_B.shape[1] * 2
-
-        bsize, npoints = xyz.shape[0], xyz.shape[1]
-        assert num_channels > 0 and num_channels % 2 == 0
-        d_in, max_d_out = self.gauss_B.shape[0], self.gauss_B.shape[1]
-        d_out = num_channels // 2
-        assert d_out <= max_d_out
-        assert d_in == xyz.shape[-1]
-
-        # clone coords so that shift/scale operations do not affect original tensor
-        orig_xyz = xyz
-        xyz = orig_xyz.clone()
-
-        ncoords = xyz.shape[1]
-        if self.normalize:
-            xyz = shift_scale_points(xyz, src_range=input_range)
-
-        xyz *= 2 * np.pi
-        xyz_proj = torch.mm(xyz.view(-1, d_in), self.gauss_B[:, :d_out]).view(
-            bsize, npoints, d_out
-        )
-        final_embeds = [xyz_proj.sin(), xyz_proj.cos()]
-
-        # return batch x d_pos x npoints embedding
-        final_embeds = torch.cat(final_embeds, dim=2).permute(0, 2, 1)
-        return final_embeds
-
-    def forward(self, xyz, num_channels=None, input_range=None):
-        assert isinstance(xyz, torch.Tensor)
-        assert xyz.ndim == 3
-        # xyz is batch x npoints x 3
-        if self.pos_type == "sine":
-            with torch.no_grad():
-                return self.get_sine_embeddings(xyz, num_channels, input_range)
-        elif self.pos_type == "fourier":
-            with torch.no_grad():
-                return self.get_fourier_embeddings(xyz, num_channels, input_range)
-        else:
-            raise ValueError(f"Unknown {self.pos_type}")
-
-    def extra_repr(self):
-        st = f"type={self.pos_type}, scale={self.scale}, normalize={self.normalize}"
-        if hasattr(self, "gauss_B"):
-            st += (
-                f", gaussB={self.gauss_B.shape}, gaussBsum={self.gauss_B.sum().item()}"
-            )
-        return st
-
-
-
 @HEADS.register_module()
-class Uni3DETRHeadCLIPDN(DETRHead):
+class Uni3DETRHeadCLIPDNSAFv2(DETRHead):
     """Head of UVTR. 
     Args:
         with_box_refine (bool): Whether to refine the reference points
@@ -388,11 +69,11 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                  post_processing=None,
                  gt_repeattimes=1,
                  noise_type='jitter',
-                 dn_weight=0.05,
+                 dn_weight=0.5,
                  ray_noise_range=[-0.3, 0.3],
+                 alpha=0.2,
+                 beta=0.45,
                  bbox_noise_scale=0.3,
-                 num_dn_query=10,
-                 cyl_div_factor=4.,
                  **kwargs):
         self.with_box_refine = with_box_refine
         self.as_two_stage = as_two_stage
@@ -411,7 +92,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.pc_range = self.bbox_coder.pc_range
         self.num_cls_fcs = num_cls_fcs - 1
 
-        super(Uni3DETRHeadCLIPDN, self).__init__(
+        super(Uni3DETRHeadCLIPDNSAFv2, self).__init__(
             *args, transformer=transformer, loss_bbox=loss_bbox, loss_iou=loss_iou, **kwargs)
         
         self.zeroshot_path = zeroshot_path
@@ -419,7 +100,8 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         zs_weights = torch.tensor(zs_weights, dtype=torch.float32)
         zs_weights = F.normalize(zs_weights, p=2,dim=1)
         zs_weights = zs_weights.permute(1, 0).contiguous()
-        self.register_buffer('zs_weights', zs_weights)
+        self.register_buffer('opn_zs_weights', zs_weights)
+        self.register_buffer('cld_zs_weights', zs_weights[:, :10])
         
         self.loss_bbox = build_loss(loss_bbox)
         self.loss_iou = build_loss(loss_iou)
@@ -437,8 +119,9 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.noise_type = noise_type
         self.dn_weight = dn_weight
         self.ray_noise_range = ray_noise_range
-        self.num_dn_query = num_dn_query
-        self.cyl_div_factor = cyl_div_factor
+        self.num_base_class = 10
+        self.alpha = alpha
+        self.beta = beta
 
 
     def _init_layers(self):
@@ -485,16 +168,26 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             self.as_two_stage else self.transformer.decoder.num_layers
 
         if self.with_box_refine:
-            self.cls_branches = _get_clones(fc_cls, num_pred)
-            self.reg_branches = _get_clones(reg_branch, num_pred)
-            self.iou_branches = _get_clones(iou_branch, num_pred)
-            self.uncertainty_branches = _get_clones(fc_uncertainty, num_pred)
+            self.opn_cls_branches = _get_clones(fc_cls, num_pred)
+            self.opn_reg_branches = _get_clones(reg_branch, num_pred)
+            self.opn_iou_branches = _get_clones(iou_branch, num_pred)
+            self.opn_uncertainty_branches = _get_clones(fc_uncertainty, num_pred)
+            self.cld_cls_branches = _get_clones(fc_cls, num_pred)
+            self.cld_reg_branches = _get_clones(reg_branch, num_pred)
+            self.cld_iou_branches = _get_clones(iou_branch, num_pred)
+            self.cld_uncertainty_branches = _get_clones(fc_uncertainty, num_pred)
         else:
-            self.cls_branches = nn.ModuleList(
+            self.opn_cls_branches = nn.ModuleList(
                 [fc_cls for _ in range(num_pred)])
-            self.reg_branches = nn.ModuleList(
+            self.opn_reg_branches = nn.ModuleList(
                 [reg_branch for _ in range(num_pred)])
-            self.iou_branches = nn.ModuleList(
+            self.opn_iou_branches = nn.ModuleList(
+                [iou_branch for _ in range(num_pred)])
+            self.cld_cls_branches = nn.ModuleList(
+                [fc_cls for _ in range(num_pred)])
+            self.cld_reg_branches = nn.ModuleList(
+                [reg_branch for _ in range(num_pred)])
+            self.cld_iou_branches = nn.ModuleList(
                 [iou_branch for _ in range(num_pred)])
 
         if not self.as_two_stage:
@@ -507,76 +200,80 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         self.transformer.init_weights()
         if self.loss_cls.use_sigmoid:
             bias_init = bias_init_with_prob(0.01)
-            for m in self.cls_branches:
+            for m in self.opn_cls_branches:
+                nn.init.constant_(m[-1].bias, bias_init)
+            for m in self.cld_cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
 
 
     def prepare_for_dn_cmt(self, batch_size, reference_points, img_metas, points=None):
-        targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
-        labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ]
-        known = [(torch.ones_like(t)).cuda() for t in labels]
-        know_idx = known
-        unmask_bbox = unmask_label = torch.cat(known)
-        known_num = [t.size(0) for t in targets]
-        labels = torch.cat([t for t in labels])
-        boxes = torch.cat([t for t in targets])
-        batch_idx = torch.cat([torch.full((t.size(0), ), i) for i, t in enumerate(targets)])
+        if self.training:
+            targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
+            labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ]
+            known = [(torch.ones_like(t)).cuda() for t in labels]
+            know_idx = known
+            unmask_bbox = unmask_label = torch.cat(known)
+            known_num = [t.size(0) for t in targets]
+            labels = torch.cat([t for t in labels])
+            boxes = torch.cat([t for t in targets])
+            batch_idx = torch.cat([torch.full((t.size(0), ), i) for i, t in enumerate(targets)])
 
-        known_indice = torch.nonzero(unmask_label + unmask_bbox)
-        known_indice = known_indice.view(-1)
-        # add noise
-        if max(known_num) == 0:
-            assert self.training == False
-            return reference_points, None, {'pad_size': 0}
-        groups = min(self.num_dn_query, self.num_query // max(known_num))
-        known_indice = known_indice.repeat(groups, 1).view(-1)
-        known_labels = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
-        known_labels_raw = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
-        known_bid = batch_idx.repeat(groups, 1).view(-1)
-        known_bboxs = boxes.repeat(groups, 1).to(reference_points.device)
-        known_bbox_center = known_bboxs[:, :3].clone()
-        known_bbox_scale = known_bboxs[:, 3:6].clone()
+            known_indice = torch.nonzero(unmask_label + unmask_bbox)
+            known_indice = known_indice.view(-1)
+            # add noise
+            groups = min(10, self.num_query // max(known_num))
+            known_indice = known_indice.repeat(groups, 1).view(-1)
+            known_labels = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
+            known_labels_raw = labels.repeat(groups, 1).view(-1).long().to(reference_points.device)
+            known_bid = batch_idx.repeat(groups, 1).view(-1)
+            known_bboxs = boxes.repeat(groups, 1).to(reference_points.device)
+            known_bbox_center = known_bboxs[:, :3].clone()
+            known_bbox_scale = known_bboxs[:, 3:6].clone()
+            
+            if self.bbox_noise_scale > 0:
+                known_bbox_center, known_labels = noise_to_query(self.noise_type,
+                                                                 known_bbox_center, known_bbox_scale, 
+                                                                 known_labels, boxes, groups,
+                                                                 self.bbox_noise_trans,
+                                                                 self.bbox_noise_scale,
+                                                                 self.split, self.num_classes,
+                                                                 ray_noise_range=self.ray_noise_range)
 
-        if self.bbox_noise_scale > 0:
-            known_bbox_center, known_labels = noise_to_query(self.noise_type, 
-                                                             known_bbox_center, known_bbox_scale, 
-                                                             known_labels, boxes, groups,
-                                                             self.bbox_noise_trans,
-                                                             self.bbox_noise_scale,
-                                                             self.split, self.num_classes,
-                                                             ray_noise_range=self.ray_noise_range,
-                                                             cyl_div_factor=self.cyl_div_factor)
+                known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
+                known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
+                known_bbox_center[..., 2:3] = (known_bbox_center[..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
+                known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)
 
-            known_bbox_center[..., 0:1] = (known_bbox_center[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
-            known_bbox_center[..., 1:2] = (known_bbox_center[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
-            known_bbox_center[..., 2:3] = (known_bbox_center[..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
-            known_bbox_center = known_bbox_center.clamp(min=0.0, max=1.0)
+            single_pad = int(max(known_num))
+            pad_size = int(single_pad * groups)
+            padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
+            padding_bbox_repeated = padding_bbox.unsqueeze(0).repeat(batch_size, 1, 1)
+            padded_reference_points = torch.cat([reference_points, padding_bbox_repeated], dim=1)
 
-        single_pad = int(max(known_num))
-        pad_size = int(single_pad * groups)
-        padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
-        padding_bbox_repeated = padding_bbox.unsqueeze(0).repeat(batch_size, 1, 1)
-        padded_reference_points = torch.cat([reference_points, padding_bbox_repeated], dim=1)
+            if len(known_num):
+                map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
+                map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(groups)]).long()
+            if len(known_bid):
+                num_ref_points = reference_points.shape[1]
+                padded_reference_points[(known_bid.long(), map_known_indice + num_ref_points)] = known_bbox_center.to(reference_points.device)
 
-        if len(known_num):
-            map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
-            map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(groups)]).long()
-        if len(known_bid):
-            num_ref_points = reference_points.shape[1]
-            padded_reference_points[(known_bid.long(), map_known_indice + num_ref_points)] = known_bbox_center.to(reference_points.device)
+            tgt_size = pad_size + self.num_query
+            attn_mask = None
 
-        tgt_size = pad_size + self.num_query
-        attn_mask = None
-
-        mask_dict = {
-            'known_indice': torch.as_tensor(known_indice).long(),
-            'batch_idx': torch.as_tensor(batch_idx).long(),
-            'map_known_indice': torch.as_tensor(map_known_indice).long(),
-            'known_lbs_bboxes': (known_labels, known_bboxs),
-            'known_labels_raw': known_labels_raw,
-            'know_idx': know_idx,
-            'pad_size': pad_size
-        }
+            mask_dict = {
+                'known_indice': torch.as_tensor(known_indice).long(),
+                'batch_idx': torch.as_tensor(batch_idx).long(),
+                'map_known_indice': torch.as_tensor(map_known_indice).long(),
+                'known_lbs_bboxes': (known_labels, known_bboxs),
+                'known_labels_raw': known_labels_raw,
+                'know_idx': know_idx,
+                'pad_size': pad_size
+            }
+            
+        else:
+            padded_reference_points = reference_points.unsqueeze(0).repeat(batch_size, 1, 1)
+            attn_mask = None
+            mask_dict = None
 
         return padded_reference_points, attn_mask, mask_dict
 
@@ -603,11 +300,11 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         if fpsbpts is not None:
             bs = fpsbpts.shape[0]
 
-            #  if pts_feats.requires_grad:
-            if 'gt_bboxes_3d' in img_metas[0]:
+            if pts_feats.requires_grad:
                 reference_points = torch.cat([refanchor.unsqueeze(0).expand(bs, -1, -1), inverse_sigmoid(fpsbpts)], 1)
                 ref_points, attn_mask, mask_dict = self.prepare_for_dn_cmt(pts_feats.shape[0], reference_points, img_metas, points=points)
                 num_dn_q = mask_dict['pad_size']
+
                 tgt_embed = torch.cat([tgt_embed[0:self.num_query], tgt_embed[self.num_query:], tgt_embed[self.num_query:],
                                        tgt_embed[self.num_query:self.num_query+num_dn_q]])
 
@@ -632,31 +329,86 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             pts_feats,
             query_embeds,
             self.num_query,
-            reg_branches=self.reg_branches if self.with_box_refine else None,
+            reg_branches=self.cld_reg_branches if self.with_box_refine else None,
             img_metas=img_metas,
             ng=4,
         )
 
         hs = hs.permute(0, 2, 1, 3)
+
+        ret_dict = {}
+
+        # open detection head (no bbox head)
         outputs_classes = []
-        outputs_coords = []
         outputs_ious = []
         outputs_uncertainties = []
 
-        #for lvl in range(hs.shape[0]):
         for lvl in range(len(hs)):
             if lvl == 0:
                 reference = init_reference
             else:
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
-            outputs_class = self.cls_branches[lvl](hs[lvl])
-            outputs_class = torch.matmul(outputs_class, self.zs_weights)
+            outputs_class = self.opn_cls_branches[lvl](hs[lvl])
+            outputs_class = torch.matmul(outputs_class, self.opn_zs_weights)
 
-            outputs_uncertainty = self.uncertainty_branches[lvl](hs[lvl])
+            outputs_uncertainty = self.opn_uncertainty_branches[lvl](hs[lvl])
 
-            tmp = self.reg_branches[lvl](hs[lvl])
-            outputs_iou = self.iou_branches[lvl](hs[lvl])
+            outputs_iou = self.opn_iou_branches[lvl](hs[lvl])
+
+            # TODO: check if using sigmoid
+            outputs_classes.append(outputs_class)
+            outputs_ious.append(outputs_iou)
+            outputs_uncertainties.append(outputs_uncertainty)
+
+        outputs_classes = torch.stack(outputs_classes)
+        outputs_ious = torch.stack(outputs_ious)
+        outputs_uncertainties = torch.stack(outputs_uncertainties)
+
+        opn_outs = {
+            'all_cls_scores': outputs_classes,
+            'all_iou_preds': outputs_ious,
+            'all_uncertainty_preds': outputs_uncertainties,
+        }
+
+        if self.training:
+            # separate query
+            dn_pad_size = mask_dict['pad_size']
+
+            opn_outs.update({
+                'all_cls_scores': outputs_classes[:, :, :-dn_pad_size, :],
+                'all_iou_preds': outputs_ious[:, :, :-dn_pad_size, :],
+                'all_uncertainty_preds': outputs_uncertainties[:, :, :-dn_pad_size, :],
+                'dn_cls_scores': outputs_classes[:, :, -dn_pad_size:, :],
+                'dn_iou_preds': outputs_ious[:, :, -dn_pad_size:, :],
+                'dn_uncertainty_preds': outputs_uncertainties[:, :, -dn_pad_size:, :],
+                'dn_mask_dict': mask_dict
+            })
+
+        ret_dict.update({'opn_outs': opn_outs})
+
+        # closed detection head
+        outputs_classes = []
+        outputs_coords = []
+        outputs_ious = []
+        outputs_uncertainties = []
+
+        for lvl in range(len(hs)):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            outputs_class = self.cld_cls_branches[lvl](hs[lvl])
+            if self.training:
+                outputs_class = torch.matmul(outputs_class, self.cld_zs_weights)
+            else:
+                outputs_class = torch.matmul(outputs_class, self.opn_zs_weights)
+
+            outputs_uncertainty = self.cld_uncertainty_branches[lvl](hs[lvl])
+
+            tmp = self.cld_reg_branches[lvl](hs[lvl])
+            outputs_iou = self.cld_iou_branches[lvl](hs[lvl])
 
             # TODO: check the shape of reference
             assert reference.shape[-1] == 3 
@@ -682,7 +434,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         outputs_ious = torch.stack(outputs_ious)
         outputs_uncertainties = torch.stack(outputs_uncertainties)
 
-        outs = {
+        cld_outs = {
             'all_cls_scores': outputs_classes,
             'all_bbox_preds': outputs_coords,
             'all_iou_preds': outputs_ious,
@@ -693,7 +445,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             # separate query
             dn_pad_size = mask_dict['pad_size']
 
-            outs.update({
+            cld_outs.update({
                 'all_cls_scores': outputs_classes[:, :, :-dn_pad_size, :],
                 'all_bbox_preds': outputs_coords[:, :, :-dn_pad_size, :],
                 'all_iou_preds': outputs_ious[:, :, :-dn_pad_size, :],
@@ -705,14 +457,39 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                 'dn_mask_dict': mask_dict
             })
 
-        return outs
+        ret_dict.update({'cld_outs': cld_outs})
+
+        if not self.training:
+            total_num_classes = cld_outs['all_cls_scores'][0].shape[-1]  # base + novel + bg
+            base_cat_ids = torch.arange(self.num_base_class) 
+            base_index = torch.zeros(total_num_classes, dtype=torch.bool, device=cld_outs['all_cls_scores'][0].device)
+            base_index[base_cat_ids] = True
+
+            fused_cls_scores = []
+            for cld_cls_scores, opn_cls_scores in zip(cld_outs['all_cls_scores'], opn_outs['all_cls_scores']):
+                # Confidence fusion using geometric mean
+                cld_cls_scores, opn_cls_scores = cld_cls_scores.sigmoid(), opn_cls_scores.sigmoid()
+                fused_scores = torch.where(
+                    base_index[None, :],
+                    cld_cls_scores ** (1 - self.alpha) * opn_cls_scores ** self.alpha,
+                    cld_cls_scores ** (self.alpha) * opn_cls_scores ** (1 - self.alpha),
+                )
+                fused_cls_scores.append(inverse_sigmoid(fused_scores))
+
+            cld_outs['all_cls_scores'] = torch.stack(fused_cls_scores)
+            return cld_outs
+
+        ret_dict.update({'cld_outs': cld_outs, 'opn_outs': opn_outs})
+
+        return ret_dict
 
     def _get_target_single(self,
                            cls_score,
                            bbox_pred,
                            gt_labels,
                            gt_bboxes,
-                           gt_bboxes_ignore=None):
+                           gt_bboxes_ignore=None,
+                           pre='opn_'):
         """"Compute regression and classification targets for one image.
         Outputs from a single decoder layer of a single feature level are used.
         Args:
@@ -740,15 +517,22 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         num_bboxes = bbox_pred.size(0)
 
         assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
-                                                gt_labels, self.num_query, gt_bboxes_ignore, self.gt_repeattimes)
+                                             gt_labels, self.num_query, gt_bboxes_ignore, self.gt_repeattimes)
         sampling_result = self.sampler.sample(assign_result, bbox_pred, gt_bboxes)
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
 
         # label targets
-        labels = gt_bboxes.new_full((num_bboxes, ),
-                                    self.num_classes,
-                                    dtype=torch.long)
+        if pre == 'opn':
+            labels = gt_bboxes.new_full((num_bboxes, ),
+                                        self.num_classes,
+                                        dtype=torch.long)
+        elif pre == 'cld':
+            labels = gt_bboxes.new_full((num_bboxes, ),
+                                        self.num_base_class,
+                                        dtype=torch.long)
+        else:
+            raise NotImplementedError
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
         label_weights = gt_bboxes.new_ones(num_bboxes)
 
@@ -759,7 +543,8 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         bbox_weights[pos_inds] = 1.0
 
         # DETR
-        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        if pos_inds.numel():
+            bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
         return (labels, label_weights, bbox_targets, bbox_weights, 
                 pos_inds, neg_inds)
 
@@ -768,7 +553,8 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                     bbox_preds_list,
                     gt_bboxes_list,
                     gt_labels_list,
-                    gt_bboxes_ignore_list=None):
+                    gt_bboxes_ignore_list=None,
+                    pre_list=None):
         """"Compute regression and classification targets for a batch image.
         Outputs from a single decoder layer of a single feature level are used.
         Args:
@@ -808,7 +594,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         (labels_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, pos_inds_list, neg_inds_list) = multi_apply(
              self._get_target_single, cls_scores_list, bbox_preds_list,
-             gt_labels_list, gt_bboxes_list, gt_bboxes_ignore_list)
+             gt_labels_list, gt_bboxes_list, gt_bboxes_ignore_list, pre_list)
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list,
@@ -821,7 +607,8 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                     uncertainty_preds,
                     gt_bboxes_list,
                     gt_labels_list,
-                    gt_bboxes_ignore_list=None):
+                    gt_bboxes_ignore_list=None,
+                    pre='opn_'):
         """"Loss function for outputs from a single decoder layer of a single
         feature level.
         Args:
@@ -844,9 +631,11 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         uncertainty_preds_list = [uncertainty_preds[i] for i in range(num_imgs)]
+        pre_list = [pre for _ in range(num_imgs)]
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
                                            gt_bboxes_list, gt_labels_list, 
-                                           gt_bboxes_ignore_list)
+                                           gt_bboxes_ignore_list,
+                                           pre_list)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
         labels = torch.cat(labels_list, 0)
@@ -859,7 +648,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         uncertainty_exp = np.sqrt(2)*torch.exp(-uncertainty_preds[:,None])
 
         # classification loss
-        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
+        cls_scores = cls_scores.reshape(-1, cls_scores.shape[-1])
         # construct weighted avg_factor to match with the official DETR repo
         cls_avg_factor = num_total_pos * 1.0 + \
             num_total_neg * self.bg_cls_weight
@@ -868,14 +657,12 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                 cls_scores.new_tensor([cls_avg_factor]))
 
         cls_avg_factor = max(cls_avg_factor, 1)
-        #loss_cls = self.loss_cls(cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
 
         bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
         normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
         bboxes3d = denormalize_bbox(bbox_preds, self.pc_range) 
 
         iou3d = bbox_overlaps_nearest_3d(bboxes3d, bbox_targets, is_aligned=True, coordinate='depth')
-        # iou3d = box_iou_rotated(DepthInstance3DBoxes(bbox_targets).bev, DepthInstance3DBoxes(bboxes3d).bev, aligned=True)
         z1, z2, z3, z4 = self._bbox_to_loss(bboxes3d)[:, 2], self._bbox_to_loss(bboxes3d)[:, 5], self._bbox_to_loss(bbox_targets)[:, 2], self._bbox_to_loss(bbox_targets)[:, 5]
         iou_z = torch.max(torch.min(z2, z4) - torch.max(z1, z3), z1.new_zeros(z1.shape)) / (torch.max(z2, z4) - torch.min(z1, z3) )
         iou3d_dec = (iou3d + iou_z)/2
@@ -905,12 +692,6 @@ class Uni3DETRHeadCLIPDN(DETRHead):
 
         loss_consistency = uncertainty_preds.mean()
 
-        # loss_cls = loss_cls[torch.isfinite(loss_cls)]
-        # loss_bbox = loss_bbox[torch.isfinite(loss_bbox)]
-        # loss_iou = loss_iou[torch.isfinite(loss_iou)]
-        # loss_iou_pred = loss_iou_pred[torch.isfinite(loss_iou_pred)]
-        # loss_consistency = loss_consistency[torch.isfinite(loss_consistency)]
-
         return loss_cls, loss_bbox, loss_iou, loss_iou_pred, loss_consistency
 
     def dn_loss_single(self,
@@ -918,7 +699,8 @@ class Uni3DETRHeadCLIPDN(DETRHead):
                        bbox_preds,
                        iou_preds,
                        uncertainty_preds,
-                       mask_dict):
+                       mask_dict,
+                       pre):
         """"Loss function for outputs from a single decoder layer of a single
         feature level.
         Args:
@@ -937,13 +719,20 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         uncertainty_preds_list = [uncertainty_preds[i] for i in range(num_imgs)]
         uncertainty_preds = torch.cat(uncertainty_preds_list, 0)
 
-
         known_labels, known_bboxs = mask_dict['known_lbs_bboxes']
         map_known_indice = mask_dict['map_known_indice'].long()
         known_indice = mask_dict['known_indice'].long()
         batch_idx = mask_dict['batch_idx'].long()
         bid = batch_idx[known_indice]
         known_labels_raw = mask_dict['known_labels_raw']
+        if pre == 'cld':
+            base_mask = known_labels < self.num_base_class
+            known_labels = known_labels[base_mask]
+            known_bboxs = known_bboxs[base_mask]
+            known_indice = known_indice[base_mask]
+            map_known_indice = map_known_indice[base_mask]
+            known_labels_raw = known_labels_raw[base_mask]
+            bid = bid[base_mask]
 
         cls_scores = cls_scores[(bid, map_known_indice)]
         bbox_preds = bbox_preds[(bid, map_known_indice)]
@@ -969,7 +758,7 @@ class Uni3DETRHeadCLIPDN(DETRHead):
 
         # classification loss
         label_weights = torch.ones_like(known_labels)
-        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
+        cls_scores = cls_scores.reshape(-1, cls_scores.shape[-1])
         # construct weighted avg_factor to match with the official DETR repo
         cls_avg_factor = num_tgt * 3.14159 / 6 * self.split * self.split  * self.split
         cls_avg_factor = max(cls_avg_factor, 1)
@@ -997,7 +786,6 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
         bbox_weights = bbox_weights * self.code_weights
         
-        # loss_bbox = self.loss_bbox(bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
         loss_bbox = self.loss_bbox(bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10] * uncertainty_exp, avg_factor=num_total_pos)
 
         loss_iou_z = 1 - iou_z[isnotnan]
@@ -1008,13 +796,10 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         iou3d_true = torch.diag(bbox_overlaps_3d(bboxes3d, bbox_targets, coordinate='lidar')).detach()
         loss_iou_pred = torch.sum(F.binary_cross_entropy_with_logits(iou_preds, iou3d_true, reduction='none') * bbox_weights[isnotnan, 0] ) / num_total_pos * 1.2 
 
-        loss_consistency = uncertainty_preds.mean()
-
-        # loss_cls = loss_cls[torch.isfinite(loss_cls)]
-        # loss_bbox = loss_bbox[torch.isfinite(loss_bbox)]
-        # loss_iou = loss_iou[torch.isfinite(loss_iou)]
-        # loss_iou_pred = loss_iou_pred[torch.isfinite(loss_iou_pred)]
-        # loss_consistency = loss_consistency[torch.isfinite(loss_consistency)]
+        if uncertainty_preds.shape[0] == 0:
+            loss_consistency = torch.zeros_like(loss_cls)
+        else:
+            loss_consistency = uncertainty_preds.mean()
 
         return loss_cls*self.dn_weight, loss_bbox*self.dn_weight, loss_iou*self.dn_weight, loss_iou_pred*self.dn_weight, loss_consistency*self.dn_weight
     
@@ -1033,12 +818,31 @@ class Uni3DETRHeadCLIPDN(DETRHead):
         ( (bbox[..., 0] + bbox[..., 3]) / 2, (bbox[..., 1] + bbox[..., 4]) / 2, (bbox[..., 2] + bbox[..., 5]) / 2,
             bbox[..., 3] - bbox[..., 0], bbox[..., 4] - bbox[..., 1], bbox[..., 5] - bbox[..., 2], bbox[..., -1] ),
             dim=-1)
+
+    def convert_opn_to_cld(self, labels_list, bboxes_list): 
+        filtered_labels_list = []
+        filtered_bboxes_list = []
+
+        for img_labels, img_bboxes in zip(labels_list, bboxes_list):
+            filtered_labels_per_img = []
+            filtered_bboxes_per_img = []
+
+            for labels, bboxes in zip(img_labels, img_bboxes):
+                mask = labels < self.num_base_class
+
+                filtered_labels_per_img.append(labels[mask])
+                filtered_bboxes_per_img.append(bboxes[mask])
+
+            filtered_labels_list.append(filtered_labels_per_img)
+            filtered_bboxes_list.append(filtered_bboxes_per_img)
+
+        return filtered_labels_list, filtered_bboxes_list
     
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self,
              gt_bboxes_list,
              gt_labels_list,
-             preds_dicts,
+             ret_dicts,
              gt_bboxes_ignore=None):
         """"Loss function.
         Args:
@@ -1071,78 +875,89 @@ class Uni3DETRHeadCLIPDN(DETRHead):
             f'{self.__class__.__name__} only supports ' \
             f'for gt_bboxes_ignore setting to None.'
 
-        all_cls_scores = preds_dicts['all_cls_scores']
-        all_bbox_preds = preds_dicts['all_bbox_preds']
-        all_iou_preds = preds_dicts['all_iou_preds']
-        all_uncertainty_preds = preds_dicts['all_uncertainty_preds']
-
-        num_dec_layers = len(all_cls_scores)
+        loss_dict = dict()
+        all_bbox_preds = ret_dicts['cld_outs']['all_bbox_preds']
+        dn_bbox_preds = ret_dicts['cld_outs']['dn_bbox_preds']
         device = gt_labels_list[0].device
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
             dim=1).to(device) for gt_bboxes in gt_bboxes_list]
+        for pre, preds_dicts in zip(['opn', 'cld'], [ret_dicts['opn_outs'], ret_dicts['cld_outs']]):
+            all_cls_scores = preds_dicts['all_cls_scores']
+            all_iou_preds = preds_dicts['all_iou_preds']
+            all_uncertainty_preds = preds_dicts['all_uncertainty_preds']
 
-        all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
-        all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
-        all_gt_bboxes_ignore_list = [
-            gt_bboxes_ignore for _ in range(num_dec_layers)
-        ]
+            num_dec_layers = len(all_cls_scores)
 
-        # calculate class and box loss
-        losses_cls, losses_bbox, losses_iou, losses_iou_pred, losses_consistency = multi_apply(
-            self.loss_single, all_cls_scores, all_bbox_preds, all_iou_preds, all_uncertainty_preds,
-            all_gt_bboxes_list, all_gt_labels_list,
-            all_gt_bboxes_ignore_list)
+            all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
+            all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
+            all_gt_bboxes_ignore_list = [
+                gt_bboxes_ignore for _ in range(num_dec_layers)
+            ]
 
-        loss_dict = dict()
+            # calculate class and box loss
+            if pre == 'cld':
+                all_gt_labels_list, all_gt_bboxes_list = self.convert_opn_to_cld(all_gt_labels_list, all_gt_bboxes_list)
+            pre_list = [pre for _ in range(len(all_cls_scores))]
+            losses_cls, losses_bbox, losses_iou, losses_iou_pred, losses_consistency = multi_apply(
+                self.loss_single, all_cls_scores, all_bbox_preds, all_iou_preds, all_uncertainty_preds,
+                all_gt_bboxes_list, all_gt_labels_list,
+                all_gt_bboxes_ignore_list, pre_list)
+            if pre == 'cld':
+                losses_bbox = [torch.zeros_like(losses_bbox[0]) for _ in range(len(losses_bbox))]
 
-        # loss from the last decoder layer
-        loss_dict['loss_cls'] = losses_cls[-1]
-        loss_dict['loss_bbox'] = losses_bbox[-1]
-        loss_dict['loss_iou'] = losses_iou[-1]
-        loss_dict['loss_iou_pred'] = losses_iou_pred[-1]
-        loss_dict['loss_consistency'] = losses_consistency[-1]
+            # loss from the last decoder layer
+            loss_dict[f'{pre}_loss_cls'] = losses_cls[-1]
+            if pre == 'opn':
+                loss_dict[f'{pre}_loss_bbox'] = losses_bbox[-1]
+            loss_dict[f'{pre}_loss_iou'] = losses_iou[-1]
+            loss_dict[f'{pre}_loss_iou_pred'] = losses_iou_pred[-1]
+            loss_dict[f'{pre}_loss_consistency'] = losses_consistency[-1]
 
-        # loss from other decoder layers
-        num_dec_layer = 0
-        for loss_cls_i, loss_bbox_i, loss_iou_i, loss_iou_pred_i, loss_consistency_i in zip(losses_cls[:-1], losses_bbox[:-1], losses_iou[:-1], losses_iou_pred[:-1], losses_consistency[:-1]):
-            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
-            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
-            loss_dict[f'd{num_dec_layer}.loss_iou'] = loss_iou_i
-            loss_dict[f'd{num_dec_layer}.loss_iou_pred'] = loss_iou_pred_i
-            loss_dict[f'd{num_dec_layer}.loss_consistency'] = loss_consistency_i
-            num_dec_layer += 1
-            
-        # for dn queries
-        dn_cls_scores = preds_dicts['dn_cls_scores']
-        dn_bbox_preds = preds_dicts['dn_bbox_preds']
-        dn_iou_preds = preds_dicts['dn_iou_preds']
-        dn_uncertainty_preds = preds_dicts['dn_uncertainty_preds']
+            # loss from other decoder layers
+            num_dec_layer = 0
+            for loss_cls_i, loss_bbox_i, loss_iou_i, loss_iou_pred_i, loss_consistency_i in zip(losses_cls[:-1], losses_bbox[:-1], losses_iou[:-1], losses_iou_pred[:-1], losses_consistency[:-1]):
+                loss_dict[f'{pre}_d{num_dec_layer}.loss_cls'] = loss_cls_i
+                if pre == 'opn':
+                    loss_dict[f'{pre}_d{num_dec_layer}.loss_bbox'] = loss_bbox_i
+                loss_dict[f'{pre}_d{num_dec_layer}.loss_iou'] = loss_iou_i
+                loss_dict[f'{pre}_d{num_dec_layer}.loss_iou_pred'] = loss_iou_pred_i
+                loss_dict[f'{pre}_d{num_dec_layer}.loss_consistency'] = loss_consistency_i
+                num_dec_layer += 1
+                
+            # for dn queries
+            dn_cls_scores = preds_dicts['dn_cls_scores']
+            dn_iou_preds = preds_dicts['dn_iou_preds']
+            dn_uncertainty_preds = preds_dicts['dn_uncertainty_preds']
 
-        num_dec_layers = len(dn_cls_scores)
-        device = gt_labels_list[0].device
+            num_dec_layers = len(dn_cls_scores)
+            device = gt_labels_list[0].device
 
-        dn_mask_dict = [preds_dicts['dn_mask_dict'] for _ in range(len(dn_iou_preds))]
-        # calculate class and box loss
-        dn_losses_cls, dn_losses_bbox, dn_losses_iou, dn_losses_iou_pred, dn_losses_consistency = multi_apply(
-            self.dn_loss_single, dn_cls_scores, dn_bbox_preds, dn_iou_preds, dn_uncertainty_preds, dn_mask_dict)
+            dn_mask_dict = [preds_dicts['dn_mask_dict'] for _ in range(len(dn_iou_preds))]
+            # calculate class and box loss
+            dn_losses_cls, dn_losses_bbox, dn_losses_iou, dn_losses_iou_pred, dn_losses_consistency = multi_apply(
+                self.dn_loss_single, dn_cls_scores, dn_bbox_preds, dn_iou_preds, dn_uncertainty_preds, dn_mask_dict, pre_list)
+            if pre == 'cld':
+                dn_losses_bbox = [torch.zeros_like(dn_losses_bbox[0]) for _ in range(len(dn_losses_bbox))]
 
-        # loss from the last decoder layer
-        loss_dict['dn_loss_cls'] = dn_losses_cls[-1]
-        loss_dict['dn_loss_bbox'] = dn_losses_bbox[-1]
-        loss_dict['dn_loss_iou'] = dn_losses_iou[-1]
-        loss_dict['dn_loss_iou_pred'] = dn_losses_iou_pred[-1]
-        loss_dict['dn_loss_consistency'] = dn_losses_consistency[-1]
+            # loss from the last decoder layer
+            loss_dict[f'{pre}_dn_loss_cls'] = dn_losses_cls[-1]
+            if pre == 'opn':
+                loss_dict[f'{pre}_dn_loss_bbox'] = dn_losses_bbox[-1]
+            loss_dict[f'{pre}_dn_loss_iou'] = dn_losses_iou[-1]
+            loss_dict[f'{pre}_dn_loss_iou_pred'] = dn_losses_iou_pred[-1]
+            loss_dict[f'{pre}_dn_loss_consistency'] = dn_losses_consistency[-1]
 
-        # loss from other decoder layers
-        num_dec_layer = 0
-        for loss_cls_i, loss_bbox_i, loss_iou_i, loss_iou_pred_i, loss_consistency_i in zip(dn_losses_cls[:-1], dn_losses_bbox[:-1], dn_losses_iou[:-1], dn_losses_iou_pred[:-1], dn_losses_consistency[:-1]):
-            loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i
-            loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
-            loss_dict[f'd{num_dec_layer}.dn_loss_iou'] = loss_iou_i
-            loss_dict[f'd{num_dec_layer}.dn_loss_iou_pred'] = loss_iou_pred_i
-            loss_dict[f'd{num_dec_layer}.dn_loss_consistency'] = loss_consistency_i
-            num_dec_layer += 1
+            # loss from other decoder layers
+            num_dec_layer = 0
+            for loss_cls_i, loss_bbox_i, loss_iou_i, loss_iou_pred_i, loss_consistency_i in zip(dn_losses_cls[:-1], dn_losses_bbox[:-1], dn_losses_iou[:-1], dn_losses_iou_pred[:-1], dn_losses_consistency[:-1]):
+                loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_cls'] = loss_cls_i
+                if pre == 'opn':
+                    loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
+                loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_iou'] = loss_iou_i
+                loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_iou_pred'] = loss_iou_pred_i
+                loss_dict[f'{pre}_d{num_dec_layer}.dn_loss_consistency'] = loss_consistency_i
+                num_dec_layer += 1
 
         return loss_dict
     

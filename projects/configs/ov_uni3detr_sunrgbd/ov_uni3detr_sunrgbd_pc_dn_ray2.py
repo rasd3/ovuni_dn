@@ -58,7 +58,7 @@ model = dict(
         extra_conv=dict(type='Conv3d', num_conv=3, bias=False),
         use_conv_for_no_stride=True),
     pts_bbox_head=dict(
-        type='Uni3DETRHeadCLIP',
+        type='Uni3DETRHeadCLIPDN',
         num_query=300,
         zeroshot_path='clip_embed/sunrgbd_clip_a+cname_rn50_manyprompt_46c_coda.npy',
         num_classes=46,
@@ -67,6 +67,9 @@ model = dict(
         with_box_refine=True,
         as_two_stage=False,
         code_size=8,
+        noise_type='ray',
+        ray_noise_range=[-0.2, 0.2],
+        dn_weight=0.1,
         transformer=dict(
             type='Uni3DETRTransformer',
             fp16_enabled=fp16_enabled,
@@ -162,7 +165,10 @@ train_pipeline = [
         load_dim=6,
         use_dim=[0, 1, 2],
         file_client_args=file_client_args),
-    dict(type='LoadAnnotations3D'),
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadAnnotations3D',
+         with_bbox=True,
+         ),
     dict(
         type='UnifiedRandomFlip3D',
         sync_2d=False,
@@ -177,7 +183,9 @@ train_pipeline = [
     #  dict(type='PointSample', num_points=20000),
     dict(type='PointSample', num_points=200000),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(type='Collect3D', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'])
+    dict(type='Collect3D', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes'],
+         meta_keys=('gt_bboxes_3d', 'gt_labels_3d')
+         )
 ]
 test_pipeline = [
     dict(
@@ -187,6 +195,7 @@ test_pipeline = [
         load_dim=6,
         use_dim=[0, 1, 2],
         file_client_args=file_client_args),
+    dict(type='LoadImageFromFile'),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     #  dict(type='PointSample', num_points=50000),
     dict(type='PointSample', num_points=200000),
@@ -198,7 +207,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=8,
+    samples_per_gpu=4,
     workers_per_gpu=4,
     train=dict(
         type='RepeatDataset',
@@ -217,7 +226,7 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         #  ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
-        ann_file=data_root + 'sunrgbd_infos_val_withimg.pkl',
+        ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,
@@ -228,7 +237,7 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         #  ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
-        ann_file=data_root + 'sunrgbd_infos_val_withimg.pkl',
+        ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,

@@ -60,18 +60,15 @@ model = dict(
     pts_bbox_head=dict(
         type='Uni3DETRHeadCLIPDNSAF',
         num_query=300,
-        zeroshot_path='clip_embed/sunrgbd_clip_a+cname_rn50_manyprompt_20c_ov3det.npy',
-        num_classes=20,
+        zeroshot_path='clip_embed/sunrgbd_clip_a+cname_rn50_manyprompt_46c_coda.npy',
+        num_classes=46,
         in_channels=256,
         sync_cls_avg_factor=True,
         with_box_refine=True,
         as_two_stage=False,
         code_size=8,
-        noise_type='ray',
-        dn_weight=0.1,
-        ray_noise_range=[0.8, 1.2],
-        alpha=0.2,
-        beta=0.8,
+        noise_type='jitter',
+        dn_weight=0.05,
         transformer=dict(
             type='Uni3DETRTransformer',
             fp16_enabled=fp16_enabled,
@@ -113,7 +110,7 @@ model = dict(
             max_num=1000,
             voxel_size=voxel_size, 
             alpha=1.0,
-            num_classes=20), 
+            num_classes=46), 
         post_processing=dict(
             type='nms',
             nms_thr=0.5),
@@ -148,8 +145,14 @@ model = dict(
 
 dataset_type = 'SUNRGBDDataset_OV'
 data_root = 'data/sunrgbd/'
-class_names = ['chair', 'table', 'pillow', 'desk', 'bed', 'sofa', 'lamp', 'garbage_bin', 'cabinet', 'sink', 'night_stand', 'stool', 'bookshelf', 'dresser', 'toilet', 'fridge', 'microwave', 'counter', 'bathtub', 'scanner']
-seen_classes = ['chair', 'table', 'pillow', 'desk', 'bed', 'sofa', 'lamp', 'garbage_bin', 'cabinet', 'sink', 'night_stand', 'stool', 'bookshelf', 'dresser', 'toilet', 'fridge', 'microwave', 'counter', 'bathtub', 'scanner']
+class_names = ('chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'box', 
+              'lamp', 'garbage_bin', 'cabinet', 'shelf', 'drawer', 'sink', 'night_stand', 'kitchen_counter', 
+              'paper', 'end_table', 'kitchen_cabinet', 'picture', 'book', 'stool', 'coffee_table', 'bookshelf', 
+              'painting', 'key_board', 'dresser', 'tv', 'whiteboard', 'cpu', 'toilet', 'file_cabinet', 'bench', 
+              'ottoman', 'plant', 'monitor', 'printer', 'recycle_bin', 'door', 'fridge', 'towel', 'cup', 'mirror', 
+              'laptop', 'cloth')
+
+seen_classes = ('chair', 'table', 'pillow', 'sofa_chair', 'desk', 'bed', 'sofa', 'computer', 'lamp', 'box')
 
 file_client_args = dict(backend='disk')
 
@@ -211,7 +214,7 @@ data = dict(
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
-            ann_file=data_root + 'sunrgbd_infos_20c_ov3det.pkl',
+            ann_file=data_root + 'sunrgbd_infos_train_pls_ens_10c36c.pkl',
             pipeline=train_pipeline,
             classes=class_names,
             seen_classes=seen_classes,
@@ -221,7 +224,8 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'sunrgbd_infos_20c_ov3det_val.pkl',
+        ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
+        #  ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,
@@ -231,7 +235,8 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'sunrgbd_infos_20c_ov3det_val.pkl',
+        ann_file=data_root + 'sunrgbd_infos_val_46cls_label_v1.pkl',
+        #  ann_file=data_root + 'sunrgbd_infos_val_46cls.pkl',
         pipeline=test_pipeline,
         classes=class_names,
         seen_classes=seen_classes,
